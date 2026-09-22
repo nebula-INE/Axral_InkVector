@@ -2,12 +2,23 @@
 VektorStudio v2 — 次世代ベクタークリエイティブスタジオ
 Phase 1-3 完全版 + Phase 4 一部
 
-バグ修正:
+バグ修正 (v2.0):
   ✓ 右クリック削除 TypeError → _delete_selected() に分離
   ✓ CmdInsertNode.undo が不完全 → 前後ノードCP含む完全スナップショット
   ✓ バケツ塗り既存パス更新にUndoなし → CmdSetFillColor 追加
   ✓ sym_cp_mirror 未使用 → ペンドラッグ時に正しく呼び出し
   ✓ SVGパーサ M/C/L/Z のみ → S/Q/T/A/H/V/s/q/t/a/h/v 追加
+
+バグ修正 (v2.1):
+  ✓ 手ブレ補正Chaikin: zip打ち切りでストローク終端が収縮 → resample_pts で正確にリサンプリング
+  ✓ 手ブレ補正CP式: dx/tang_len*tang_len*0.33 のキャンセル → 正規化ベクトルで正確に計算
+  ✓ 集中線二重描画: 単一VPathによるジグザグ+正描画の重複 → List[VPath]に分割し drawLine で直接描画
+  ✓ 集中線PNG書き出し: _draw_focus_lines 未呼び出し → _render_path に drawLine 追加
+  ✓ 効果線ツール死亡: mouseReleaseEvent ディスパッチなし → _speed_release 実装・ドラッグ方向自動判定
+  ✓ _add_node_press エッジケース: node_b_actual=None → 閉じたパスラップアラウンド対応・デッドコード除去
+  ✓ get_persp_snap 未実装スタブ → 最近傍透視ガイド線へのスナップ実装
+  ✓ _export_svg デッドコード → 削除
+  ✓ insert_node_at 型注釈 → Optional[Tuple] に修正
 
 新機能:
   Phase 2:
@@ -216,7 +227,7 @@ def _rotate_pt(p: QPointF, c: QPointF, deg: float) -> QPointF:
                    c.y()+dx*math.sin(r)+dy*math.cos(r))
 
 def chaikin_smooth(pts: List[QPointF], iterations: int=2) -> List[QPointF]:
-    """Chaikinアルゴリズムによる手ブレ補正"""
+    """Chaikinアルゴリズムによる手ブレ補正（点数が増える）"""
     for _ in range(iterations):
         if len(pts)<3: break
         new_pts=[pts[0]]
@@ -227,6 +238,14 @@ def chaikin_smooth(pts: List[QPointF], iterations: int=2) -> List[QPointF]:
         new_pts.append(pts[-1])
         pts=new_pts
     return pts
+
+def resample_pts(pts: List[QPointF], target_n: int) -> List[QPointF]:
+    """点列を target_n 点に均等リサンプリング（Chaikin後の点数合わせに使用）"""
+    if len(pts)==0: return pts
+    if len(pts)==1: return [pts[0]]*target_n
+    if target_n<=1: return [pts[0]]
+    step=(len(pts)-1)/(target_n-1)
+    return [pts[min(int(round(i*step)),len(pts)-1)] for i in range(target_n)]
 
 def lowpass_smooth(pts: List[QPointF], alpha: float=0.4) -> List[QPointF]:
     """ローパスフィルタによる手ブレ補正"""
@@ -319,7 +338,7 @@ class VPath:
 
     def bounding_rect(self): return self.to_qpath().boundingRect()
 
-    def insert_node_at(self,pt) -> Optional['VNode']:
+    def insert_node_at(self,pt) -> Optional[Tuple['VNode',int,QPointF,QPointF]]:
         if len(self.nodes)<2: return None
         best_i,best_t,best_d=0,0.5,float('inf')
         segs=len(self.nodes)-(0 if self.closed else 1)
@@ -931,23 +950,28 @@ def make_panel(rect: QRectF, border_w: float=3.0) -> VPath:
     return vp
 
 def make_focus_lines(center: QPointF, outer_r: float, inner_r: float,
-                     count: int=64, jitter: float=2.0) -> VPath:
-    """集中線VPath生成"""
-    vp=VPath(); vp.stroke_color=QColor("#000000"); vp.stroke_width=1.0
-    vp.meta={"type":"focus_lines"}
+                     count: int=64, jitter: float=2.0,
+                     stroke_color: QColor=None, stroke_width: float=1.0) -> List['VPath']:
+    """集中線を独立した VPath のリストとして生成（Bug2修正: 単一VPathによるジグザグ・二重描画を排除）"""
     import random; rng=random.Random(42)
+    if stroke_color is None: stroke_color=QColor("#000000")
+    paths=[]
     for i in range(count):
         angle=2*math.pi*i/count+rng.uniform(-0.05,0.05)
         ix=center.x()+math.cos(angle)*(inner_r+rng.uniform(0,inner_r*0.2))
         iy=center.y()+math.sin(angle)*(inner_r+rng.uniform(0,inner_r*0.2))
         ox=center.x()+math.cos(angle+rng.uniform(-0.01,0.01))*outer_r
         oy=center.y()+math.sin(angle+rng.uniform(-0.01,0.01))*outer_r
+        # 太さにランダム変化を加える（奥行き感）
+        w=stroke_width*(0.5+rng.uniform(0,1.0))
+        vp=VPath()
+        vp.stroke_color=QColor(stroke_color); vp.stroke_width=w
+        vp.fill_color=QColor(Qt.transparent)
         n1=VNode(QPointF(ix,iy)); n2=VNode(QPointF(ox,oy))
-        n1.cp_out=n1.pos; n2.cp_in=n2.pos
-        vp.nodes.append(n1); vp.nodes.append(n2)
-    # 複数の独立した線 → 擬似的に全ノードを繋ぐ（描画時はセグメント単位）
-    vp.meta["line_pairs"]=count
-    return vp
+        n1.cp_out=QPointF(n1.pos); n2.cp_in=QPointF(n2.pos)
+        vp.nodes=[n1,n2]; vp.meta={"type":"focus_line_single"}
+        paths.append(vp)
+    return paths
 
 def make_speed_lines(rect: QRectF, direction: str="right",
                      count: int=20, density: float=0.7) -> List[VPath]:
@@ -980,14 +1004,32 @@ def make_speed_lines(rect: QRectF, direction: str="right",
 # ══════════════════════════════════════════════════════════════
 #  パース定規
 # ══════════════════════════════════════════════════════════════
-def get_persp_snap(doc: Document, pt: QPointF) -> QPointF:
-    """透視グリッドに沿った点スナップ"""
+def get_persp_snap(doc: Document, pt: QPointF, snap_radius: float=20.0) -> QPointF:
+    """
+    透視グリッドに沿った点スナップ（Bug5修正: 実際のスナップを実装）
+    消失点から伸びる最近傍の透視線上に pt を射影する。
+    snap_radius より遠い場合はスナップしない。
+    """
     if doc.perspective==PERSP_NONE: return pt
-    vp1=doc.persp_vp1
-    # 最も近い透視線方向にスナップ
-    dx=pt.x()-vp1.x(); dy=pt.y()-vp1.y()
-    if abs(dx)<0.001 and abs(dy)<0.001: return pt
-    return pt  # 簡易: スナップは視覚ガイドのみ
+    def snap_to_vp(vp_pt: QPointF, guide_step_deg: float=15.0) -> Tuple[QPointF,float]:
+        """消失点 vp_pt から pt への方向に最も近いガイド角に射影した点と距離を返す"""
+        dx=pt.x()-vp_pt.x(); dy=pt.y()-vp_pt.y()
+        dist_to_vp=math.hypot(dx,dy)
+        if dist_to_vp<0.001: return (QPointF(pt),float('inf'))
+        angle_rad=math.atan2(dy,dx)
+        step_rad=math.radians(guide_step_deg)
+        snapped_angle=round(angle_rad/step_rad)*step_rad
+        # 射影点 = 消失点から snapped_angle 方向に dist_to_vp の距離
+        sx=vp_pt.x()+math.cos(snapped_angle)*dist_to_vp
+        sy=vp_pt.y()+math.sin(snapped_angle)*dist_to_vp
+        snapped=QPointF(sx,sy)
+        perp_dist=QLineF(snapped,pt).length()
+        return (snapped, perp_dist)
+    best_pt=pt; best_dist=snap_radius
+    for vp_pt in ([doc.persp_vp1] + ([doc.persp_vp2] if doc.perspective==PERSP_2PT else [])):
+        sp,d=snap_to_vp(vp_pt)
+        if d<best_dist: best_dist=d; best_pt=sp
+    return best_pt
 
 # ══════════════════════════════════════════════════════════════
 #  画像書き出し
@@ -1021,6 +1063,12 @@ def render_to_image(doc: Document, scale: float=1.0, brush_defs: Dict=None) -> Q
 def _render_path(painter: QPainter, vp: VPath, brush_defs: Dict):
     if not vp.visible: return
     painter.setOpacity(vp.opacity)
+    # 集中線/効果線の単一線分は drawLine で直接描画（Bug2修正: PNG書き出し対応）
+    if vp.meta.get("type") in ("focus_line_single","speed_line") and len(vp.nodes)==2:
+        pen=QPen(vp.stroke_color,vp.stroke_width,Qt.SolidLine,Qt.FlatCap)
+        painter.setPen(pen); painter.setBrush(Qt.NoBrush)
+        painter.drawLine(vp.nodes[0].pos,vp.nodes[1].pos)
+        painter.setOpacity(1.0); return
     qpath=vp.to_qpath()
     if vp.fill_color.alpha()>0:
         painter.fillPath(qpath,QBrush(vp.fill_color))
@@ -1194,6 +1242,17 @@ class Canvas(QWidget):
     def _draw_path(self,p,vp:VPath,preview=False,sym=False):
         if not vp.visible: return
         p.setOpacity(vp.opacity)
+        # 集中線・効果線の単一線分はジグザグ防止のため drawLine で直接描画（Bug2修正）
+        is_line_seg=(vp.meta.get("type") in ("focus_line_single","speed_line")
+                     and len(vp.nodes)==2)
+        if is_line_seg and not preview:
+            pen=QPen(vp.stroke_color,vp.stroke_width,Qt.SolidLine,Qt.FlatCap)
+            p.setPen(pen); p.setBrush(Qt.NoBrush)
+            p.drawLine(vp.nodes[0].pos,vp.nodes[1].pos)
+            if vp in self.selected:
+                hi=QPen(QColor(C["accent"]),vp.stroke_width+2,Qt.SolidLine,Qt.FlatCap)
+                p.setPen(hi); p.drawLine(vp.nodes[0].pos,vp.nodes[1].pos)
+            p.setOpacity(1.0); return
         qpath=vp.to_qpath()
         if vp.fill_color.alpha()>0: p.fillPath(qpath,QBrush(vp.fill_color))
         # トーン
@@ -1210,18 +1269,7 @@ class Canvas(QWidget):
             p.setPen(glow); p.setBrush(Qt.NoBrush); p.drawPath(qpath)
             hi=QPen(QColor(C["accent"]),max(vp.stroke_width+2,3),Qt.SolidLine,Qt.RoundCap)
             p.setPen(hi); p.drawPath(qpath)
-        # 集中線は特殊描画
-        if vp.meta.get("type")=="focus_lines":
-            self._draw_focus_lines(p,vp)
         p.setOpacity(1.0)
-
-    def _draw_focus_lines(self,p,vp:VPath):
-        count=vp.meta.get("line_pairs",0)
-        if count==0 or len(vp.nodes)<2: return
-        pen=QPen(vp.stroke_color,vp.stroke_width,Qt.SolidLine,Qt.FlatCap)
-        p.setPen(pen); p.setBrush(Qt.NoBrush)
-        for i in range(0,len(vp.nodes)-1,2):
-            p.drawLine(vp.nodes[i].pos,vp.nodes[i+1].pos)
 
     def _draw_balloon_preview(self,p):
         if not hasattr(self,'_balloon_cur'): return
@@ -1364,13 +1412,14 @@ class Canvas(QWidget):
             self.setCursor(Qt.OpenHandCursor if self.tool==TOOL_HAND else Qt.ArrowCursor); return
         if ev.button()==Qt.LeftButton:
             dp=self.to_doc(ev.position())
-            if   self.tool==TOOL_PEN:      self._pen_release(dp)
-            elif self.tool==TOOL_RESHAPE:  self._reshape_release(dp)
-            elif self.tool==TOOL_SELECT:   self._select_release(dp)
-            elif self.tool==TOOL_WIDTH:    self._width_release(dp)
-            elif self.tool==TOOL_BALLOON:  self._balloon_release(dp)
-            elif self.tool==TOOL_PANEL:    self._panel_release(dp)
+            if   self.tool==TOOL_PEN:        self._pen_release(dp)
+            elif self.tool==TOOL_RESHAPE:    self._reshape_release(dp)
+            elif self.tool==TOOL_SELECT:     self._select_release(dp)
+            elif self.tool==TOOL_WIDTH:      self._width_release(dp)
+            elif self.tool==TOOL_BALLOON:    self._balloon_release(dp)
+            elif self.tool==TOOL_PANEL:      self._panel_release(dp)
             elif self.tool==TOOL_FOCUS_LINE: self._focus_release(dp)
+            elif self.tool==TOOL_SPEED_LINE: self._speed_release(dp)  # Bug3修正
 
     def mouseDoubleClickEvent(self,ev):
         if self.tool==TOOL_PEN: self._pen_finish()
@@ -1445,6 +1494,8 @@ class Canvas(QWidget):
 
     # ─── ペン ───
     def _pen_press(self,dp):
+        # パース定規スナップ適用
+        dp=get_persp_snap(self.doc, dp, snap_radius=20/self._scale)
         if not self._pen_drawing:
             vp=VPath(); vp.stroke_color=QColor(self.pen_color)
             vp.stroke_width=self.pen_width; vp.fill_color=QColor(self.fill_color)
@@ -1481,21 +1532,29 @@ class Canvas(QWidget):
         if self._pen_path and len(self._pen_path.nodes)>=2:
             # 手ブレ補正
             if self.smoothing>0:
-                raw_pos=[n.pos for n in self._pen_path.nodes]
-                smoothed=lowpass_smooth(raw_pos,max(0.1,1-self.smoothing))
-                smoothed=chaikin_smooth(smoothed,int(self.smoothing*2))
-                # スムージングを適用したノードに置き換え (CPはリセット)
-                for i,(n,sp) in enumerate(zip(self._pen_path.nodes,smoothed)):
-                    n.pos=sp
-                    if 0<i<len(smoothed)-1:
-                        prev_p=smoothed[i-1]; next_p=smoothed[i+1]
-                        dx=next_p.x()-prev_p.x(); dy=next_p.y()-prev_p.y()
-                        tang_len=math.hypot(dx,dy)*0.3
-                        if tang_len>0:
-                            n.cp_in =QPointF(sp.x()-dx/tang_len*tang_len*0.33,
-                                             sp.y()-dy/tang_len*tang_len*0.33)
-                            n.cp_out=QPointF(sp.x()+dx/tang_len*tang_len*0.33,
-                                             sp.y()+dy/tang_len*tang_len*0.33)
+                nodes=self._pen_path.nodes
+                raw_pos=[n.pos for n in nodes]
+                # ローパス → Chaikin (点数が増える)
+                sm=lowpass_smooth(raw_pos, max(0.1, 1-self.smoothing))
+                sm=chaikin_smooth(sm, int(self.smoothing*2)+1)
+                # 元のノード数に合わせてリサンプリング (Bug1修正: zip打ち切り問題)
+                sm=resample_pts(sm, len(nodes))
+                # 各ノードの pos と CP を更新
+                for i, (n, sp) in enumerate(zip(nodes, sm)):
+                    n.pos=QPointF(sp)
+                    # 前後の平滑化済み点からタンジェントを計算してCPを設定
+                    prev_p = sm[i-1] if i>0 else sp
+                    next_p = sm[i+1] if i<len(sm)-1 else sp
+                    dx=next_p.x()-prev_p.x(); dy=next_p.y()-prev_p.y()
+                    seg_len=math.hypot(dx,dy)
+                    if seg_len>0.001:
+                        # CP長はセグメント長の1/3
+                        cp_len=seg_len*0.33
+                        ux=dx/seg_len; uy=dy/seg_len
+                        n.cp_in =QPointF(sp.x()-ux*cp_len, sp.y()-uy*cp_len)
+                        n.cp_out=QPointF(sp.x()+ux*cp_len, sp.y()+uy*cp_len)
+                    else:
+                        n.cp_in=QPointF(sp); n.cp_out=QPointF(sp)
             layer=self.doc.active_layer
             self.undo.beginMacro("ペン描画")
             self.undo.push(CmdAddPath(layer,self._pen_path))
@@ -1646,29 +1705,26 @@ class Canvas(QWidget):
 
     # ─── アンカー追加 (バグ修正2) ───
     def _add_node_press(self,dp):
+        """Bug4修正: 閉じたパス末尾セグメント等のエッジケースも完全Undo対応"""
         hit=self._hit_paths(dp)
         if not hit and self.selected: hit=self.selected[0]
         if not hit: return
-        a_idx=len(hit.nodes)//2-1 if len(hit.nodes)>=2 else 0
-        node_a=hit.nodes[a_idx] if hit.nodes else None
-        node_b=hit.nodes[(a_idx+1)%len(hit.nodes)] if len(hit.nodes)>=2 else None
-        if node_a and node_b:
-            old_a_out=QPointF(node_a.cp_out); old_b_in=QPointF(node_b.cp_in)
+        # insert_node_at は (new_node, idx, old_a_out, old_b_in) のタプルを返す
         result=hit.insert_node_at(dp)
         if result is None: return
-        new_node,idx,old_a_out2,old_b_in2=result
-        # 挿入後の前後ノード参照
-        node_a_actual=hit.nodes[idx-1] if idx>0 else None
-        node_b_actual=hit.nodes[idx+1] if idx<len(hit.nodes)-1 else None
-        if node_a_actual and node_b_actual:
-            new_a_out=QPointF(node_a_actual.cp_out); new_b_in=QPointF(node_b_actual.cp_in)
-            # 一旦元に戻してコマンド経由で適用
-            hit.nodes.remove(new_node)
-            node_a_actual.cp_out=old_a_out2; node_b_actual.cp_in=old_b_in2
-            self.undo.push(CmdInsertNode(hit,new_node,idx,node_a_actual,node_b_actual,
-                                         old_a_out2,old_b_in2,new_a_out,new_b_in))
-        else:
-            hit.nodes.remove(new_node); hit.nodes.insert(idx,new_node)
+        new_node, idx, old_a_out, old_b_in = result
+        # 挿入後の前後ノード参照（閉じたパスのラップアラウンドも考慮）
+        n_total=len(hit.nodes)  # new_node 挿入済み状態
+        node_a=hit.nodes[(idx-1) % n_total]
+        node_b=hit.nodes[(idx+1) % n_total]
+        new_a_out=QPointF(node_a.cp_out); new_b_in=QPointF(node_b.cp_in)
+        # 一旦元の状態に戻してからコマンド経由で適用（Undo対応）
+        hit.nodes.remove(new_node)
+        node_a.cp_out=QPointF(old_a_out); node_b.cp_in=QPointF(old_b_in)
+        self.undo.push(CmdInsertNode(hit, new_node, idx,
+                                     node_a, node_b,
+                                     old_a_out, old_b_in,
+                                     new_a_out, new_b_in))
         self.selected=[hit]; self.sel_node=new_node
         self.selection_changed.emit(self.selected)
         self.document_changed.emit(); self.update()
@@ -1799,24 +1855,48 @@ class Canvas(QWidget):
         if not self._focus_center: return
         center=self._focus_center
         outer_r=QLineF(center,dp).length()
+        if outer_r<5: self._focus_center=None; self.update(); return
         inner_r=outer_r*0.2
         count=getattr(self,'_focus_count',64)
-        vp=make_focus_lines(center,outer_r,inner_r,count)
-        vp.stroke_color=QColor(self.pen_color); vp.stroke_width=self.pen_width
+        # Bug2修正: List[VPath] を返す新バージョンを使用
+        paths=make_focus_lines(center,outer_r,inner_r,count,
+                               stroke_color=self.pen_color,stroke_width=self.pen_width)
         layer=self.doc.active_layer
-        self.undo.push(CmdAddPath(layer,vp))
-        self.selected=[vp]; self.selection_changed.emit(self.selected)
+        self.undo.beginMacro("集中線")
+        for vp in paths: self.undo.push(CmdAddPath(layer,vp))
+        self.undo.endMacro()
+        self.selected=paths; self.selection_changed.emit(self.selected)
         self.document_changed.emit()
         self._focus_center=None; self.update()
 
     # ─── 効果線 ───
     def _speed_press(self,dp):
-        # ドラッグ方向で向きを決定
+        """ドラッグ開始点を記録"""
         self._speed_start=QPointF(dp)
 
-    def _speed_drag(self,dp): pass
+    def _speed_drag(self,dp):
+        """ドラッグ中はプレビュー矢印を表示（軽量）"""
+        self._speed_cur=QPointF(dp); self.update()
+
+    def _speed_release(self,dp):
+        """Bug3修正: ドラッグ方向からスピード線方向を自動判定して生成"""
+        if not hasattr(self,'_speed_start'): return
+        start=self._speed_start; end=QPointF(dp)
+        dx=end.x()-start.x(); dy=end.y()-start.y()
+        dist=math.hypot(dx,dy)
+        if dist<5:
+            # 短いクリックはパネルの選択方向で生成
+            direction=getattr(self,'_speed_dir','right')
+        else:
+            if abs(dx)>=abs(dy):
+                direction="right" if dx>0 else "left"
+            else:
+                direction="down" if dy>0 else "up"
+        self._speed_release_dir(direction)
+        self._speed_start=None
 
     def _speed_release_dir(self,direction):
+        """ToolOptionsPanel の「効果線を生成」ボタンからも呼ばれる"""
         rect=QRectF(0,0,self.doc.width,self.doc.height)
         count=getattr(self,'_speed_count',20)
         paths=make_speed_lines(rect,direction,count)
@@ -2657,9 +2737,6 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(f"書き出し完了: {path}",3000)
         except Exception as e:
             QMessageBox.critical(self,"エラー",f"書き出し失敗:\n{e}")
-
-    def _export_svg(self):
-        self._export("SVG")
 
     def _write_svg(self,path):
         try:
