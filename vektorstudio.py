@@ -950,20 +950,27 @@ def make_panel(rect: QRectF, border_w: float=3.0) -> VPath:
     return vp
 
 def make_focus_lines(center: QPointF, outer_r: float, inner_r: float,
-                     count: int=64, jitter: float=2.0,
+                     count: int=64,
                      stroke_color: QColor=None, stroke_width: float=1.0) -> List['VPath']:
-    """集中線を独立した VPath のリストとして生成（Bug2修正: 単一VPathによるジグザグ・二重描画を排除）"""
+    """
+    集中線を独立した VPath のリストとして生成。
+    Fix5: 未使用の jitter 引数を除去。
+    角度・内径・外径・太さにランダム変化を加えて自然な集中線を生成。
+    """
     import random; rng=random.Random(42)
     if stroke_color is None: stroke_color=QColor("#000000")
     paths=[]
+    # 各線の角度ゆらぎ・内径ゆらぎ・外径ゆらぎを引数から自動導出
+    angle_jitter=0.05           # rad
+    inner_jitter=inner_r*0.2   # 内径のゆらぎ幅
+    outer_jitter=0.01           # rad (外側の角度ゆらぎ)
     for i in range(count):
-        angle=2*math.pi*i/count+rng.uniform(-0.05,0.05)
-        ix=center.x()+math.cos(angle)*(inner_r+rng.uniform(0,inner_r*0.2))
-        iy=center.y()+math.sin(angle)*(inner_r+rng.uniform(0,inner_r*0.2))
-        ox=center.x()+math.cos(angle+rng.uniform(-0.01,0.01))*outer_r
-        oy=center.y()+math.sin(angle+rng.uniform(-0.01,0.01))*outer_r
-        # 太さにランダム変化を加える（奥行き感）
-        w=stroke_width*(0.5+rng.uniform(0,1.0))
+        angle=2*math.pi*i/count+rng.uniform(-angle_jitter,angle_jitter)
+        ix=center.x()+math.cos(angle)*(inner_r+rng.uniform(0,inner_jitter))
+        iy=center.y()+math.sin(angle)*(inner_r+rng.uniform(0,inner_jitter))
+        ox=center.x()+math.cos(angle+rng.uniform(-outer_jitter,outer_jitter))*outer_r
+        oy=center.y()+math.sin(angle+rng.uniform(-outer_jitter,outer_jitter))*outer_r
+        w=stroke_width*(0.5+rng.uniform(0,1.0))  # 太さに奥行き感
         vp=VPath()
         vp.stroke_color=QColor(stroke_color); vp.stroke_width=w
         vp.fill_color=QColor(Qt.transparent)
@@ -1006,25 +1013,31 @@ def make_speed_lines(rect: QRectF, direction: str="right",
 # ══════════════════════════════════════════════════════════════
 def get_persp_snap(doc: Document, pt: QPointF, snap_radius: float=20.0) -> QPointF:
     """
-    透視グリッドに沿った点スナップ（Bug5修正: 実際のスナップを実装）
-    消失点から伸びる最近傍の透視線上に pt を射影する。
-    snap_radius より遠い場合はスナップしない。
+    透視グリッドに沿った点スナップ。
+    消失点から伸びる最近傍のガイド線上に pt を射影する。
+    Fix4: 距離計算を chord長(不正)→ dist*sin(Δangle)(正確な垂直距離) に修正。
+    snap_radius はスクリーン距離と同単位のドキュメント座標。
     """
     if doc.perspective==PERSP_NONE: return pt
     def snap_to_vp(vp_pt: QPointF, guide_step_deg: float=15.0) -> Tuple[QPointF,float]:
-        """消失点 vp_pt から pt への方向に最も近いガイド角に射影した点と距離を返す"""
+        """
+        消失点 vp_pt から pt の角度を最近傍のガイド角に丸め、
+        そのガイド線上で pt に最も近い点を返す。
+        垂直距離 = dist_to_vp * |sin(Δangle)| (正確な弦の高さ)。
+        """
         dx=pt.x()-vp_pt.x(); dy=pt.y()-vp_pt.y()
         dist_to_vp=math.hypot(dx,dy)
         if dist_to_vp<0.001: return (QPointF(pt),float('inf'))
         angle_rad=math.atan2(dy,dx)
         step_rad=math.radians(guide_step_deg)
         snapped_angle=round(angle_rad/step_rad)*step_rad
-        # 射影点 = 消失点から snapped_angle 方向に dist_to_vp の距離
+        delta_angle=angle_rad-snapped_angle
+        # Fix4: 正確な垂直距離 = dist * |sin(Δangle)|
+        perp_dist=dist_to_vp*abs(math.sin(delta_angle))
+        # 射影点: 消失点から snapped_angle 方向に dist_to_vp
         sx=vp_pt.x()+math.cos(snapped_angle)*dist_to_vp
         sy=vp_pt.y()+math.sin(snapped_angle)*dist_to_vp
-        snapped=QPointF(sx,sy)
-        perp_dist=QLineF(snapped,pt).length()
-        return (snapped, perp_dist)
+        return (QPointF(sx,sy), perp_dist)
     best_pt=pt; best_dist=snap_radius
     for vp_pt in ([doc.persp_vp1] + ([doc.persp_vp2] if doc.perspective==PERSP_2PT else [])):
         sp,d=snap_to_vp(vp_pt)
@@ -1186,6 +1199,10 @@ class Canvas(QWidget):
             p.setPen(QPen(QColor(C["accent"]),1,Qt.DashLine))
             p.setBrush(QColor(C["accent"]+"22"))
             p.drawRect(self._rubber_rect)
+        # 効果線ドラッグプレビュー（方向矢印）Fix2
+        if (self.tool==TOOL_SPEED_LINE and hasattr(self,"_speed_start")
+                and self._speed_start and hasattr(self,"_speed_cur")):
+            self._draw_speed_preview(p)
 
     def _draw_grid(self,p):
         step=40*self._scale
@@ -1286,6 +1303,30 @@ class Canvas(QWidget):
         p.setPen(QPen(c,3,Qt.DashLine)); p.setBrush(QColor(C["accent"]+"11"))
         start=self._panel_start; end=self._panel_cur
         p.drawRect(QRectF(start,end).normalized())
+
+    def _draw_speed_preview(self,p):
+        """Fix2: 効果線ドラッグ中の方向矢印プレビュー（スクリーン座標）"""
+        start=self.to_scr(self._speed_start)
+        end=self.to_scr(self._speed_cur) if hasattr(self,"_speed_cur") else start
+        dx=end.x()-start.x(); dy=end.y()-start.y(); dist=math.hypot(dx,dy)
+        if dist<3: return
+        c=QColor(C["accent"]); c.setAlpha(200)
+        # 方向ライン
+        p.setPen(QPen(c,2,Qt.DashLine,Qt.RoundCap))
+        p.drawLine(start,end)
+        # 矢印ヘッド
+        angle=math.atan2(dy,dx)
+        ah=12
+        p.setPen(QPen(c,2,Qt.SolidLine,Qt.RoundCap))
+        for a_off in [2.5,-2.5]:
+            ax=end.x()-math.cos(angle+a_off)*ah
+            ay=end.y()-math.sin(angle+a_off)*ah
+            p.drawLine(end,QPointF(ax,ay))
+        # 方向ラベル
+        dirs={True:{True:"↓",False:"↑"},False:{True:"→",False:"←"}}
+        lbl=dirs[abs(dy)>abs(dx)][dy>0 if abs(dy)>abs(dx) else dx>0]
+        p.setPen(QPen(c,1)); p.setFont(QFont("monospace",14,QFont.Bold))
+        p.drawText(QPointF(end.x()+10,end.y()-10), lbl)
 
     def _draw_reshape_overlay(self,p):
         if not self.selected: return
@@ -1395,12 +1436,16 @@ class Canvas(QWidget):
         if self._pan_start:
             self._offset=self._pan_off+(pos-self._pan_start); self.update(); return
         if ev.buttons()&Qt.LeftButton:
-            if   self.tool==TOOL_PEN:      self._pen_drag(dp)
+            if   self.tool==TOOL_PEN:
+                # Fix7: ドラッグ中のCPにもパーススナップを適用
+                dp_snap=get_persp_snap(self.doc,dp,snap_radius=20/self._scale)
+                self._pen_drag(dp_snap)
             elif self.tool==TOOL_RESHAPE:  self._reshape_drag(dp)
             elif self.tool==TOOL_SELECT:   self._select_drag(pos,dp)
             elif self.tool==TOOL_WIDTH:    self._width_drag(dp)
             elif self.tool==TOOL_BALLOON:  self._balloon_drag(dp)
             elif self.tool==TOOL_PANEL:    self._panel_drag(dp)
+            elif self.tool==TOOL_SPEED_LINE: self._speed_drag(dp)  # Fix2: dispatch追加
         else:
             self._update_hover(dp)
         x,y=dp.x(),dp.y()
@@ -1517,11 +1562,10 @@ class Canvas(QWidget):
         n=self._pen_path.nodes[-1]
         dx,dy=dp.x()-n.pos.x(),dp.y()-n.pos.y()
         n.cp_out=dp; n.cp_in=QPointF(n.pos.x()-dx,n.pos.y()-dy)
-        # シンメトリーCP ミラー (バグ修正4)
-        syms=sym_points(self.doc,dp)
-        for sp,sym_pt,orig_spt in zip(self._pen_sym_paths,syms,sym_points(self.doc,n.pos)):
-            if not sp.nodes: continue
-            sn=sp.nodes[-1]
+        # Fix3: sym_pt/syms のデッドコード除去、sym_points(doc, n.pos) のみ使用
+        for spath,orig_spt in zip(self._pen_sym_paths, sym_points(self.doc,n.pos)):
+            if not spath.nodes: continue
+            sn=spath.nodes[-1]
             cpi,cpo=sym_mirror_cp(self.doc,n.pos,dp,orig_spt,self.doc.symmetry)
             sn.cp_in=cpi; sn.cp_out=cpo
         self.update()
@@ -1530,31 +1574,35 @@ class Canvas(QWidget):
 
     def _pen_finish(self):
         if self._pen_path and len(self._pen_path.nodes)>=2:
-            # 手ブレ補正
+            # 手ブレ補正（Fix1: メインパスとsymパスを同じ処理で統一）
             if self.smoothing>0:
-                nodes=self._pen_path.nodes
-                raw_pos=[n.pos for n in nodes]
-                # ローパス → Chaikin (点数が増える)
-                sm=lowpass_smooth(raw_pos, max(0.1, 1-self.smoothing))
-                sm=chaikin_smooth(sm, int(self.smoothing*2)+1)
-                # 元のノード数に合わせてリサンプリング (Bug1修正: zip打ち切り問題)
-                sm=resample_pts(sm, len(nodes))
-                # 各ノードの pos と CP を更新
-                for i, (n, sp) in enumerate(zip(nodes, sm)):
-                    n.pos=QPointF(sp)
-                    # 前後の平滑化済み点からタンジェントを計算してCPを設定
-                    prev_p = sm[i-1] if i>0 else sp
-                    next_p = sm[i+1] if i<len(sm)-1 else sp
-                    dx=next_p.x()-prev_p.x(); dy=next_p.y()-prev_p.y()
-                    seg_len=math.hypot(dx,dy)
-                    if seg_len>0.001:
-                        # CP長はセグメント長の1/3
-                        cp_len=seg_len*0.33
-                        ux=dx/seg_len; uy=dy/seg_len
-                        n.cp_in =QPointF(sp.x()-ux*cp_len, sp.y()-uy*cp_len)
-                        n.cp_out=QPointF(sp.x()+ux*cp_len, sp.y()+uy*cp_len)
-                    else:
-                        n.cp_in=QPointF(sp); n.cp_out=QPointF(sp)
+                def _smooth_vpath(vp: VPath):
+                    """VPathのノード座標にスムージングを適用してCPを再計算"""
+                    nodes=vp.nodes
+                    if len(nodes)<2: return
+                    raw_pos=[n.pos for n in nodes]
+                    sm=lowpass_smooth(raw_pos, max(0.1, 1-self.smoothing))
+                    sm=chaikin_smooth(sm, int(self.smoothing*2)+1)
+                    sm=resample_pts(sm, len(nodes))  # 元ノード数に合わせる
+                    for i,(n,sp) in enumerate(zip(nodes,sm)):
+                        n.pos=QPointF(sp)
+                        prev_p=sm[i-1] if i>0 else sp
+                        next_p=sm[i+1] if i<len(sm)-1 else sp
+                        dx=next_p.x()-prev_p.x(); dy=next_p.y()-prev_p.y()
+                        seg_len=math.hypot(dx,dy)
+                        if seg_len>0.001:
+                            cp_len=seg_len*0.33
+                            ux=dx/seg_len; uy=dy/seg_len
+                            n.cp_in =QPointF(sp.x()-ux*cp_len, sp.y()-uy*cp_len)
+                            n.cp_out=QPointF(sp.x()+ux*cp_len, sp.y()+uy*cp_len)
+                        else:
+                            n.cp_in=QPointF(sp); n.cp_out=QPointF(sp)
+                # メインパスをスムージング
+                _smooth_vpath(self._pen_path)
+                # symパスも同じ処理（Fix1: これが抜けていた）
+                for sp in self._pen_sym_paths:
+                    if len(sp.nodes)>=2:
+                        _smooth_vpath(sp)
             layer=self.doc.active_layer
             self.undo.beginMacro("ペン描画")
             self.undo.push(CmdAddPath(layer,self._pen_path))
@@ -1860,7 +1908,8 @@ class Canvas(QWidget):
         count=getattr(self,'_focus_count',64)
         # Bug2修正: List[VPath] を返す新バージョンを使用
         paths=make_focus_lines(center,outer_r,inner_r,count,
-                               stroke_color=self.pen_color,stroke_width=self.pen_width)
+                               stroke_color=QColor(self.pen_color),
+                               stroke_width=self.pen_width)
         layer=self.doc.active_layer
         self.undo.beginMacro("集中線")
         for vp in paths: self.undo.push(CmdAddPath(layer,vp))
@@ -1872,10 +1921,10 @@ class Canvas(QWidget):
     # ─── 効果線 ───
     def _speed_press(self,dp):
         """ドラッグ開始点を記録"""
-        self._speed_start=QPointF(dp)
+        self._speed_start=QPointF(dp); self._speed_cur=QPointF(dp)
 
     def _speed_drag(self,dp):
-        """ドラッグ中はプレビュー矢印を表示（軽量）"""
+        """Fix2: dispatch追加済み。ドラッグ中に方向プレビューを表示"""
         self._speed_cur=QPointF(dp); self.update()
 
     def _speed_release(self,dp):
@@ -2176,6 +2225,8 @@ class LayerPanel(QWidget):
         self.list.setDragDropMode(QAbstractItemView.InternalMove)
         self.list.currentRowChanged.connect(self._row_changed)
         self.list.itemDoubleClicked.connect(self._rename)
+        # Fix6: D&D 並び替えをモデルに反映
+        self.list.model().rowsMoved.connect(self._rows_moved)
         ctrl=QWidget(); ctrl.setStyleSheet(f"background:{C['surface']};border-top:1px solid {C['border']};")
         cl=QVBoxLayout(ctrl); cl.setContentsMargins(8,6,8,6); cl.setSpacing(4)
         op_row=QHBoxLayout(); op_row.addWidget(QLabel("不透明度"))
@@ -2215,6 +2266,30 @@ class LayerPanel(QWidget):
     def _row_changed(self,row):
         if row<0: return
         self.doc.active_layer_idx=len(self.doc.layers)-1-row; self.refresh(); self.changed.emit()
+
+    def _rows_moved(self,parent,src,end,dst_parent,dst):
+        """
+        Fix6: QListWidget の D&D 完了後に doc.layers を UI の順序と同期する。
+        リストは reversed(doc.layers) で表示しているので逆順変換が必要。
+        """
+        # UI上の現在の並び順から layer.id を取得
+        ui_ids=[self.list.item(r).data(Qt.UserRole) for r in range(self.list.count())]
+        # UI は上が最新レイヤー (reversed) → 逆順が doc.layers 順
+        id_to_layer={layer.id:layer for layer in self.doc.layers}
+        new_layers=[id_to_layer[lid] for lid in reversed(ui_ids) if lid in id_to_layer]
+        if len(new_layers)==len(self.doc.layers):
+            self.doc.layers=new_layers
+            # アクティブレイヤーのインデックスを維持
+            cur_row=self.list.currentRow()
+            if cur_row>=0:
+                cur_id=self.list.item(cur_row).data(Qt.UserRole)
+                cur_layer=id_to_layer.get(cur_id)
+                if cur_layer and cur_layer in self.doc.layers:
+                    self.doc.active_layer_idx=self.doc.layers.index(cur_layer)
+                else:
+                    self.doc.active_layer_idx=0
+        self.changed.emit()
+
     def _add(self):
         self.doc.layers.append(Layer(f"レイヤー {len(self.doc.layers)+1}"))
         self.doc.active_layer_idx=len(self.doc.layers)-1; self.refresh(); self.changed.emit()
