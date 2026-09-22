@@ -1,0 +1,197 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # Release 作成用
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (arm64)
+            os: macos-14
+            artifact: VektorStudio-macOS-arm64
+          - name: macOS (x86_64)
+            os: macos-13
+            artifact: VektorStudio-macOS-x86_64
+          - name: Windows
+            os: windows-latest
+            artifact: VektorStudio-Windows
+          - name: Linux
+            os: ubuntu-22.04
+            artifact: VektorStudio-Linux
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      # ── Linux 追加ライブラリ (Qt ランタイム) ──
+      - name: Install Linux Qt runtime libs
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1 libegl1 libxkbcommon-x11-0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-randr0 libxcb-render-util0 libxcb-xinerama0 \
+            libxcb-xfixes0 libxcb-cursor0 libdbus-1-3
+
+      # ═════════════════════════════════════════════
+      #  macOS ビルド + Ad-hoc 署名
+      # ═════════════════════════════════════════════
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller --noconfirm --clean \
+            --name VektorStudio \
+            --windowed \
+            --onedir \
+            --osx-bundle-identifier com.vose.vektorstudio \
+            vektorstudio.py
+
+      - name: Ad-hoc code sign (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          APP="dist/VektorStudio.app"
+
+          # (1) 拡張属性を除去 (署名を壊す xattr を消す)
+          xattr -cr "$APP" || true
+
+          # (2) Frameworks 内の dylib / .so / 実行ファイルを inside-out で署名
+          find "$APP/Contents/Frameworks" -type f \
+            \( -name "*.dylib" -o -name "*.so" -o -perm -111 \) \
+            -print0 | xargs -0 -I{} codesign --force --timestamp=none --sign - {} 2>/dev/null || true
+
+          # (3) メインバイナリを署名
+          find "$APP/Contents/MacOS" -type f -perm -111 \
+            -print0 | xargs -0 -I{} codesign --force --timestamp=none --sign - {} 2>/dev/null || true
+
+          # (4) 外側の .app バンドルを署名
+          codesign --force --deep --timestamp=none --sign - "$APP"
+
+          # (5) 検証
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          echo "─── Signature info ───"
+          codesign -dv --verbose=4 "$APP" 2>&1 | tee codesign-info.txt
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        env:
+          ARTIFACT_NAME: ${{ matrix.artifact }}
+        run: |
+          cd dist
+          # .app を壊さず zip 化 (quarantine 属性を保持)
+          ditto -c -k --sequesterRsrc --keepParent VektorStudio.app "${ARTIFACT_NAME}.zip"
+          # DMG も生成
+          hdiutil create -volname "VektorStudio" \
+            -srcfolder VektorStudio.app \
+            -ov -format UDZO "${ARTIFACT_NAME}.dmg"
+          shasum -a 256 "${ARTIFACT_NAME}.zip" "${ARTIFACT_NAME}.dmg" > SHA256SUMS.txt
+
+      # ═════════════════════════════════════════════
+      #  Windows ビルド
+      # ═════════════════════════════════════════════
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pyinstaller --noconfirm --clean `
+            --name VektorStudio `
+            --windowed `
+            --onefile `
+            vektorstudio.py
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd dist
+          Compress-Archive -Path VektorStudio.exe -DestinationPath "${{ matrix.artifact }}.zip"
+          $hash = (Get-FileHash "${{ matrix.artifact }}.zip" -Algorithm SHA256).Hash
+          "$hash  ${{ matrix.artifact }}.zip" | Out-File SHA256SUMS.txt -Encoding ascii
+
+      # ═════════════════════════════════════════════
+      #  Linux ビルド
+      # ═════════════════════════════════════════════
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          pyinstaller --noconfirm --clean \
+            --name VektorStudio \
+            --onefile \
+            vektorstudio.py
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        env:
+          ARTIFACT_NAME: ${{ matrix.artifact }}
+        run: |
+          cd dist
+          chmod +x VektorStudio
+          tar -czvf "${ARTIFACT_NAME}.tar.gz" VektorStudio
+          sha256sum "${ARTIFACT_NAME}.tar.gz" > SHA256SUMS.txt
+
+      # ═════════════════════════════════════════════
+      #  アーティファクト アップロード
+      # ═════════════════════════════════════════════
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/*.zip
+            dist/*.dmg
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  # ═════════════════════════════════════════════
+  #  タグ push 時に Release へ添付
+  # ═════════════════════════════════════════════
+  release:
+    name: Create Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect release files
+        run: |
+          mkdir -p release
+          find artifacts -type f \
+            \( -name "*.zip" -o -name "*.dmg" -o -name "*.tar.gz" -o -name "SHA256SUMS.txt" \) \
+            -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          draft: false
+          generate_release_notes: true
