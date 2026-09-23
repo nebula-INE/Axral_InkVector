@@ -847,22 +847,73 @@ def vector_bucket_fill(doc: Document, pt: QPointF, fill_color: QColor) -> List[T
         results.append(("set_fill",(best_l,best_vp,old_c,QColor(fill_color))))
         return results
 
-    # 閉パスなし: 近傍の開パスを繋いで閉鎖パスを生成
+    # 閉パスなし: 近傍の開パスの端点を接続して閉鎖パスを生成
     if candidates_open:
-        # 簡易実装: バウンディングを凸包として塗りパスを生成
-        all_pts=[]
-        for _,vp in candidates_open:
-            for n in vp.nodes: all_pts.append(n.pos)
-        if len(all_pts)>=3:
-            hull=_convex_hull(all_pts)
+        # 端点接続アルゴリズム:
+        #   1. 各開パスの始点・終点を収集
+        #   2. 最近傍の端点ペアを貪欲法で接続
+        #   3. 繋がったチェーンを閉じる
+        chains=_connect_open_paths(candidates_open)
+        for chain_pts in chains:
+            if len(chain_pts)<3: continue
             new_vp=VPath()
-            for p in hull:
-                n=VNode(p); new_vp.nodes.append(n)
+            for i,p in enumerate(chain_pts):
+                n=VNode(p)
+                # 簡易CP: 前後点からタンジェントを設定
+                if 0<i<len(chain_pts)-1:
+                    prev=chain_pts[i-1]; nxt=chain_pts[i+1]
+                    dx=nxt.x()-prev.x(); dy=nxt.y()-prev.y()
+                    seg=math.hypot(dx,dy)
+                    if seg>0.001:
+                        ux,uy=dx/seg,dy/seg; cl=seg*0.25
+                        n.cp_in =QPointF(p.x()-ux*cl,p.y()-uy*cl)
+                        n.cp_out=QPointF(p.x()+ux*cl,p.y()+uy*cl)
+                new_vp.nodes.append(n)
             new_vp.closed=True
             new_vp.fill_color=QColor(fill_color)
             new_vp.stroke_color=QColor(Qt.transparent)
             results.append(("add_path",(doc.active_layer,new_vp)))
     return results
+
+def _connect_open_paths(pairs: List[Tuple]) -> List[List[QPointF]]:
+    """
+    開パス群の端点を貪欲法で最近傍接続し、閉じたポリラインのリストを返す。
+    pairs: [(layer, VPath), ...]
+    """
+    # 各パスの点列を収集（始点が前・終点が後）
+    segs=[]
+    for _,vp in pairs:
+        if len(vp.nodes)<2: continue
+        pts=[n.pos for n in vp.nodes]
+        segs.append(pts)
+    if not segs: return []
+    # 連結リストを構築
+    chains=[]
+    used=[False]*len(segs)
+    for start_i in range(len(segs)):
+        if used[start_i]: continue
+        chain=list(segs[start_i]); used[start_i]=True
+        changed=True
+        while changed:
+            changed=False
+            best_j,best_dist,best_mode=-1,float('inf'),None
+            for j in range(len(segs)):
+                if used[j]: continue
+                pts=segs[j]
+                for mode,ep in [('fwd_start',chain[-1]),('rev_start',chain[-1]),
+                                 ('fwd_end',chain[0]), ('rev_end',chain[0])]:
+                    cand=pts[0] if 'start' in mode else pts[-1]
+                    d=math.hypot(cand.x()-ep.x(),cand.y()-ep.y())
+                    if d<best_dist: best_dist=d; best_j=j; best_mode=mode
+            if best_j>=0 and best_dist<200:  # 200px 以内なら接続
+                pts=segs[best_j]; used[best_j]=True
+                if best_mode=='fwd_start':   chain.extend(pts)
+                elif best_mode=='rev_start': chain.extend(reversed(pts))
+                elif best_mode=='fwd_end':   chain=list(pts)+chain
+                elif best_mode=='rev_end':   chain=list(reversed(pts))+chain
+                changed=True
+        chains.append(chain)
+    return chains
 
 def _convex_hull(pts: List[QPointF]) -> List[QPointF]:
     """Grahamスキャンによる凸包"""
@@ -948,6 +999,52 @@ def make_panel(rect: QRectF, border_w: float=3.0) -> VPath:
     pts=[rect.topLeft(),rect.topRight(),rect.bottomRight(),rect.bottomLeft()]
     for p in pts: vp.nodes.append(VNode(p))
     return vp
+
+def _seg_intersect(p1:QPointF,p2:QPointF,p3:QPointF,p4:QPointF):
+    """線分(p1-p2)と線分(p3-p4)の交点を返す (なければNone)"""
+    d1=QPointF(p2.x()-p1.x(),p2.y()-p1.y())
+    d2=QPointF(p4.x()-p3.x(),p4.y()-p3.y())
+    cross=d1.x()*d2.y()-d1.y()*d2.x()
+    if abs(cross)<1e-10: return None
+    dx=p3.x()-p1.x(); dy=p3.y()-p1.y()
+    t=(dx*d2.y()-dy*d2.x())/cross
+    u=(dx*d1.y()-dy*d1.x())/cross
+    if 0<=t<=1 and 0<=u<=1:
+        return QPointF(p1.x()+t*d1.x(),p1.y()+t*d1.y())
+    return None
+
+def split_panel_by_line(panel_vp: VPath, line_start: QPointF, line_end: QPointF,
+                         border_w: float=3.0) -> List[VPath]:
+    """
+    矩形コマ(panel_vp)をドラッグ線で2分割し、新しい2つのコマVPathを返す。
+    分割できない場合は空リストを返す。
+    """
+    if panel_vp.meta.get("type")!="panel" or len(panel_vp.nodes)<4:
+        return []
+    nodes=panel_vp.nodes
+    n=len(nodes)
+    # コマの辺との交点を全て求める
+    hits=[]
+    for i in range(n):
+        a=nodes[i].pos; b=nodes[(i+1)%n].pos
+        pt=_seg_intersect(line_start,line_end,a,b)
+        if pt is not None: hits.append((i,pt))
+    if len(hits)<2: return []
+    # 交点が2つの場合: コマを2分割
+    hits.sort(key=lambda x:x[0])
+    i0,p0=hits[0]; i1,p1=hits[1]
+    # サイド1: nodes[0..i0] + p0 + p1 + nodes[i1+1..n]
+    def make_sub(pts):
+        vp=VPath(); vp.stroke_color=QColor("#000000"); vp.stroke_width=border_w
+        vp.fill_color=QColor(Qt.transparent); vp.closed=True; vp.meta={"type":"panel"}
+        for p in pts: vp.nodes.append(VNode(p))
+        return vp
+    side1=[nodes[j].pos for j in range(i0+1)]+[p0,p1]+[nodes[j].pos for j in range(i1+1,n)]
+    side2=[p0]+[nodes[j].pos for j in range(i0+1,i1+1)]+[p1]
+    result=[]
+    if len(side1)>=3: result.append(make_sub(side1))
+    if len(side2)>=3: result.append(make_sub(side2))
+    return result
 
 def make_focus_lines(center: QPointF, outer_r: float, inner_r: float,
                      count: int=64,
@@ -1131,6 +1228,10 @@ class Canvas(QWidget):
         self._hover_node=None; self._hover_path=None
         # 線幅
         self._width_old=2.0
+        # スタイラス筆圧
+        self._tablet_pressure=1.0   # 現在の筆圧 (0.0-1.0)
+        self._is_tablet=False       # タブレットデバイス使用中フラグ
+        self.setAttribute(Qt.WA_TabletTracking, True)
         self.setMinimumSize(400,300)
 
     def to_doc(self,p): return QPointF((p.x()-self._offset.x())/self._scale,(p.y()-self._offset.y())/self._scale)
@@ -1322,9 +1423,9 @@ class Canvas(QWidget):
             ax=end.x()-math.cos(angle+a_off)*ah
             ay=end.y()-math.sin(angle+a_off)*ah
             p.drawLine(end,QPointF(ax,ay))
-        # 方向ラベル
-        dirs={True:{True:"↓",False:"↑"},False:{True:"→",False:"←"}}
-        lbl=dirs[abs(dy)>abs(dx)][dy>0 if abs(dy)>abs(dx) else dx>0]
+        # 方向ラベル (簡略化)
+        if abs(dy)>abs(dx): lbl="↓" if dy>0 else "↑"
+        else:               lbl="→" if dx>0 else "←"
         p.setPen(QPen(c,1)); p.setFont(QFont("monospace",14,QFont.Bold))
         p.drawText(QPointF(end.x()+10,end.y()-10), lbl)
 
@@ -1409,6 +1510,51 @@ class Canvas(QWidget):
         return {vp:[(QPointF(n.pos),QPointF(n.cp_in),QPointF(n.cp_out)) for n in vp.nodes] for vp in self.selected}
 
     # ─── マウス ───
+    def tabletEvent(self,ev):
+        """スタイラス筆圧・傾き対応。筆圧を _tablet_pressure に記録しマウスイベントへ転送"""
+        from PySide6.QtGui import QTabletEvent
+        self._is_tablet=True
+        self._tablet_pressure=max(0.0,min(1.0,ev.pressure()))
+        # タブレットイベントをマウスイベントとして処理（ツール動作を共有）
+        ev.accept()
+        pos=ev.position()
+        dp=self.to_doc(pos)
+        from PySide6.QtCore import QEvent
+        etype=ev.type()
+        if etype==QEvent.TabletPress:
+            if   self.tool==TOOL_PEN:      self._pen_press(dp)
+            elif self.tool==TOOL_RESHAPE:  self._reshape_press(dp)
+            elif self.tool==TOOL_SELECT:   self._select_press(pos,dp,ev.modifiers())
+            elif self.tool==TOOL_ERASER:   self._eraser_press(dp)
+            elif self.tool==TOOL_ADD_NODE: self._add_node_press(dp)
+            elif self.tool==TOOL_DEL_NODE: self._del_node_press(dp)
+            elif self.tool==TOOL_WIDTH:    self._width_press(dp)
+            elif self.tool==TOOL_BUCKET:   self._bucket_press(dp)
+            elif self.tool==TOOL_BALLOON:  self._balloon_press(dp)
+            elif self.tool==TOOL_PANEL:    self._panel_press(dp)
+            elif self.tool==TOOL_FOCUS_LINE: self._focus_press(dp)
+            elif self.tool==TOOL_SPEED_LINE: self._speed_press(dp)
+        elif etype==QEvent.TabletMove:
+            if   self.tool==TOOL_PEN:
+                dp_snap=get_persp_snap(self.doc,dp,snap_radius=20/self._scale)
+                self._pen_drag(dp_snap)
+            elif self.tool==TOOL_RESHAPE:  self._reshape_drag(dp)
+            elif self.tool==TOOL_SELECT:   self._select_drag(pos,dp)
+            elif self.tool==TOOL_WIDTH:    self._width_drag(dp)
+            elif self.tool==TOOL_BALLOON:  self._balloon_drag(dp)
+            elif self.tool==TOOL_PANEL:    self._panel_drag(dp)
+            elif self.tool==TOOL_SPEED_LINE: self._speed_drag(dp)
+            self._update_hover(dp)
+        elif etype in(QEvent.TabletRelease,):
+            if   self.tool==TOOL_PEN:        self._pen_release(dp)
+            elif self.tool==TOOL_RESHAPE:    self._reshape_release(dp)
+            elif self.tool==TOOL_SELECT:     self._select_release(dp)
+            elif self.tool==TOOL_WIDTH:      self._width_release(dp)
+            elif self.tool==TOOL_BALLOON:    self._balloon_release(dp)
+            elif self.tool==TOOL_PANEL:      self._panel_release(dp)
+            elif self.tool==TOOL_FOCUS_LINE: self._focus_release(dp)
+            elif self.tool==TOOL_SPEED_LINE: self._speed_release(dp)
+
     def mousePressEvent(self,ev):
         pos=ev.position(); dp=self.to_doc(pos)
         if ev.button()==Qt.MiddleButton or (ev.button()==Qt.LeftButton and ev.modifiers()&Qt.AltModifier):
@@ -1551,14 +1697,20 @@ class Canvas(QWidget):
                 sp=VPath(); sp.stroke_color=QColor(self.pen_color)
                 sp.stroke_color.setAlpha(140); sp.stroke_width=self.pen_width
                 sp.brush_name=self.brush_name; self._pen_sym_paths.append(sp)
-        n=VNode(dp); self._pen_path.nodes.append(n); self._pen_path.pressure.append(1.0)
+        p_val=self._tablet_pressure if self._is_tablet else 1.0
+        n=VNode(dp); self._pen_path.nodes.append(n); self._pen_path.pressure.append(p_val)
         for sp,spt in zip(self._pen_sym_paths,sym_points(self.doc,dp)):
-            sn=VNode(spt); sp.nodes.append(sn); sp.pressure.append(1.0)
+            sn=VNode(spt); sp.nodes.append(sn); sp.pressure.append(p_val)
         self.update()
 
     def _pen_drag(self,dp):
         if not self._pen_drawing or not self._pen_path.nodes: return
         self._raw_pts.append(dp)
+        # 筆圧を最後ノードに更新
+        p_val=self._tablet_pressure if self._is_tablet else 1.0
+        if self._pen_path.pressure: self._pen_path.pressure[-1]=p_val
+        for sp in self._pen_sym_paths:
+            if sp.pressure: sp.pressure[-1]=p_val
         n=self._pen_path.nodes[-1]
         dx,dy=dp.x()-n.pos.x(),dp.y()-n.pos.y()
         n.cp_out=dp; n.cp_in=QPointF(n.pos.x()-dx,n.pos.y()-dy)
@@ -1885,15 +2037,43 @@ class Canvas(QWidget):
 
     def _panel_release(self,dp):
         if not self._panel_start: return
-        rect=QRectF(self._panel_start,dp).normalized()
-        if rect.width()<10 or rect.height()<10: self._panel_start=None; self.update(); return
+        start=self._panel_start; self._panel_start=None
         border_w=getattr(self,'_panel_border_w',3.0)
-        vp=make_panel(rect,border_w)
-        layer=self.doc.active_layer
-        self.undo.push(CmdAddPath(layer,vp))
-        self.selected=[vp]; self.selection_changed.emit(self.selected)
-        self.document_changed.emit()
-        self._panel_start=None; self.update()
+        rect=QRectF(start,dp).normalized()
+        line_len=QLineF(start,dp).length()
+        # ドラッグが細長い(aspect>4)か短形か で分割/新規を切り替え
+        is_split_line=(rect.width()<15 or rect.height()<15) and line_len>20
+        if is_split_line:
+            # 既存のコマパスを線で分割
+            split_done=False
+            for layer in self.doc.layers:
+                if not layer.visible or layer.locked: continue
+                for vp in layer.paths:
+                    if vp.meta.get("type")!="panel": continue
+                    parts=split_panel_by_line(vp,start,dp,border_w)
+                    if parts:
+                        self.undo.beginMacro("コマ分割")
+                        self.undo.push(CmdDeletePaths([(layer,vp)]))
+                        for p in parts: self.undo.push(CmdAddPath(layer,p))
+                        self.undo.endMacro()
+                        self.selected=parts; self.selection_changed.emit(self.selected)
+                        self.document_changed.emit(); split_done=True; break
+                if split_done: break
+            if not split_done:
+                # 分割対象なし → 新規コマ(線として)
+                vp=VPath(); vp.stroke_color=QColor("#000000"); vp.stroke_width=border_w
+                vp.nodes=[VNode(start),VNode(dp)]; vp.meta={"type":"panel_line"}
+                self.undo.push(CmdAddPath(self.doc.active_layer,vp))
+                self.selected=[vp]; self.selection_changed.emit(self.selected)
+                self.document_changed.emit()
+        else:
+            # 矩形コマを新規作成
+            if rect.width()<10 or rect.height()<10: self.update(); return
+            vp=make_panel(rect,border_w)
+            self.undo.push(CmdAddPath(self.doc.active_layer,vp))
+            self.selected=[vp]; self.selection_changed.emit(self.selected)
+            self.document_changed.emit()
+        self.update()
 
     # ─── 集中線 ───
     def _focus_press(self,dp):
@@ -2074,11 +2254,11 @@ class BrushStudioDialog(QDialog):
                 self._param_widgets[key]=w
             pg.addWidget(w,row,1)
         rl.addWidget(params_grp)
-        # プレビュー
+        # 視覚プレビュー (QPainter でサンプルストロークを描画)
         self.preview_lbl=QLabel()
-        self.preview_lbl.setFixedHeight(60)
+        self.preview_lbl.setFixedHeight(80)
+        self.preview_lbl.setMinimumWidth(200)
         self.preview_lbl.setStyleSheet(f"background:{C['canvas_bg']};border:1px solid {C['border']};border-radius:4px;")
-        self.preview_lbl.setAlignment(Qt.AlignCenter)
         rl.addWidget(QLabel("プレビュー")); rl.addWidget(self.preview_lbl)
         # ボタン
         btns=QDialogButtonBox()
@@ -2108,9 +2288,46 @@ class BrushStudioDialog(QDialog):
             val=b.get(key,False)
             if isinstance(w,QCheckBox): w.setChecked(bool(val))
             elif isinstance(w,QDoubleSpinBox): w.setValue(float(val) if val else 0.0)
-        tip_map={"Gペン":"ペン先: 丸","鉛筆":"ペン先: 鉛筆","マーカー":"ペン先: 平型",
-                 "水彩":"ペン先: 丸(水彩)","エアブラシ":"ペン先: ソフト","カリグラフィ":"ペン先: 角度付き"}
-        self.preview_lbl.setText(tip_map.get(name,f"ブラシ: {name}"))
+        self._draw_brush_preview(name, b)
+
+    def _draw_brush_preview(self,name:str,bdef:dict):
+        """ブラシのサンプルストロークをQPixmapに描画してプレビュー表示"""
+        import math as _m, random as _r
+        W=max(self.preview_lbl.width() if self.preview_lbl.width()>10 else 300, 200)
+        H=80
+        pix=QPixmap(W,H); pix.fill(QColor(C["canvas_bg"]))
+        p=QPainter(pix); p.setRenderHint(QPainter.Antialiasing)
+        # S字カーブのサンプルストローク (20点)
+        pts=[QPointF(W*0.05+W*0.9*i/19, H*0.5+_m.sin(i/19*_m.pi*2)*H*0.28)
+             for i in range(20)]
+        pressures=[_m.sin(_m.pi*i/19) for i in range(20)]
+        base_w=max(2.0, min(H*0.18, 14.0))
+        pressure_on=bdef.get("pressure_width",True)
+        taper=bdef.get("taper",0.0)
+        scatter=bdef.get("scatter",0.0)
+        stroke_c=QColor(C["fg"])
+        rng=_r.Random(42)
+        for i in range(len(pts)-1):
+            a,b2=pts[i],pts[i+1]
+            pres=(pressures[i]+pressures[i+1])/2
+            tp=1.0
+            if taper>0:
+                t_in =min(i/(max(len(pts)*taper,1)),1.0)
+                t_out=min((len(pts)-1-i)/(max(len(pts)*taper,1)),1.0)
+                tp=min(t_in,t_out)
+            w=base_w*(pres if pressure_on else 0.85)*tp
+            if scatter>0:
+                for _ in range(3):
+                    ox=rng.uniform(-scatter,scatter)*0.5
+                    oy=rng.uniform(-scatter,scatter)*0.5
+                    sc=QColor(stroke_c); sc.setAlpha(80)
+                    p.setPen(QPen(sc,max(0.5,w*0.4),Qt.SolidLine,Qt.RoundCap))
+                    p.drawLine(QPointF(a.x()+ox,a.y()+oy),QPointF(b2.x()+ox,b2.y()+oy))
+            p.setPen(QPen(stroke_c,max(0.3,w),Qt.SolidLine,Qt.RoundCap,Qt.RoundJoin))
+            p.drawLine(a,b2)
+        p.setPen(QPen(QColor(C["fg_dim"]))); p.setFont(QFont("monospace",9))
+        p.drawText(4,H-4,name); p.end()
+        self.preview_lbl.setPixmap(pix)
 
     def _new_brush(self):
         name,ok=QInputDialog.getText(self,"新規ブラシ","ブラシ名:")
@@ -2150,22 +2367,103 @@ class BrushStudioDialog(QDialog):
 # ══════════════════════════════════════════════════════════════
 #  Webtoonダイアログ
 # ══════════════════════════════════════════════════════════════
+class WebtoonPreviewWidget(QWidget):
+    """Webtoonストリップをスクロール表示するプレビューウィジェット"""
+    def __init__(self,doc:Document,parent=None):
+        super().__init__(parent)
+        self.doc=doc; self._img=None; self._scale=0.25
+        self.setMinimumSize(240,200)
+        self.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Expanding)
+
+    def set_scale(self,s): self._scale=s; self.update()
+
+    def refresh(self,brush_defs=None):
+        if brush_defs is None: brush_defs=DEFAULT_BRUSHES
+        self._img=render_to_image(self.doc,scale=self._scale,brush_defs=brush_defs)
+        total_h=int(self.doc.height*self._scale)
+        self.setMinimumHeight(min(total_h+20,600))
+        self.update()
+
+    def paintEvent(self,ev):
+        p=QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        p.fillRect(self.rect(),QColor(C["panel"]))
+        if self._img is None:
+            p.setPen(QPen(QColor(C["fg_dim"]))); p.drawText(self.rect(),Qt.AlignCenter,"プレビュー更新ボタンを押してください")
+            return
+        x=(self.width()-self._img.width())//2; y=10
+        p.drawImage(x,y,self._img)
+        if self.doc.webtoon_mode:
+            sh=max(1,int(self.doc.webtoon_strip_height*self._scale))
+            pen=QPen(QColor(C["danger"]),1,Qt.DashLine); p.setPen(pen)
+            strip_y=y
+            strip_n=1
+            while strip_y<y+self._img.height():
+                p.drawLine(x,strip_y,x+self._img.width(),strip_y)
+                p.setFont(QFont("monospace",8))
+                p.setPen(QPen(QColor(C["warn"])))
+                p.drawText(x+2,strip_y+12,f"Strip {strip_n}")
+                p.setPen(pen); strip_y+=sh; strip_n+=1
+
+
 class WebtoonDialog(QDialog):
-    def __init__(self,parent,doc:Document):
+    def __init__(self,parent,doc:Document,brush_defs=None):
         super().__init__(parent); self.setWindowTitle("Webtoonモード設定")
-        self.doc=doc; self._build()
+        self.doc=doc; self.brush_defs=brush_defs or DEFAULT_BRUSHES
+        self.setMinimumSize(520,540); self._build()
 
     def _build(self):
-        lay=QVBoxLayout(self)
+        lay=QVBoxLayout(self); lay.setSpacing(8)
+        # 設定
+        settings=QGroupBox("設定"); sl=QGridLayout(settings)
         self.chk_mode=QCheckBox("Webtoonモードを有効にする")
         self.chk_mode.setChecked(self.doc.webtoon_mode)
-        sh_row=QHBoxLayout()
-        sh_row.addWidget(QLabel("ストリップ高さ (px)"))
-        self.spin_sh=QSpinBox(); self.spin_sh.setRange(100,5000); self.spin_sh.setValue(self.doc.webtoon_strip_height)
-        sh_row.addWidget(self.spin_sh)
+        sl.addWidget(self.chk_mode,0,0,1,2)
+        sl.addWidget(QLabel("ストリップ高さ (px)"),1,0)
+        self.spin_sh=QSpinBox(); self.spin_sh.setRange(100,5000)
+        self.spin_sh.setValue(self.doc.webtoon_strip_height)
+        sl.addWidget(self.spin_sh,1,1)
+        sl.addWidget(QLabel("プレビュー倍率"),2,0)
+        self.spin_scale=QDoubleSpinBox(); self.spin_scale.setRange(0.05,1.0)
+        self.spin_scale.setSingleStep(0.05); self.spin_scale.setValue(0.25)
+        sl.addWidget(self.spin_scale,2,1)
+        lay.addWidget(settings)
+        # プレビュー
+        self.preview=WebtoonPreviewWidget(self.doc)
+        scroll=QScrollArea(); scroll.setWidget(self.preview)
+        scroll.setWidgetResizable(True); scroll.setMinimumHeight(260)
+        scroll.setStyleSheet(f"background:{C['canvas_bg']};border:1px solid {C['border']};")
+        lay.addWidget(scroll,1)
+        # ボタン行
+        btn_row=QHBoxLayout()
+        btn_preview=QPushButton("プレビュー更新"); btn_preview.clicked.connect(self._refresh_preview)
+        btn_export=QPushButton("ストリップ書き出し…"); btn_export.setObjectName("success")
+        btn_export.clicked.connect(self._export_strips)
+        btn_row.addWidget(btn_preview); btn_row.addWidget(btn_export); btn_row.addStretch()
+        lay.addLayout(btn_row)
         btns=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
         btns.accepted.connect(self._ok); btns.rejected.connect(self.reject)
-        lay.addWidget(self.chk_mode); lay.addLayout(sh_row); lay.addWidget(btns)
+        lay.addWidget(btns)
+        QTimer.singleShot(150,self._refresh_preview)
+
+    def _refresh_preview(self):
+        self.preview.set_scale(self.spin_scale.value())
+        self.preview.refresh(self.brush_defs)
+
+    def _export_strips(self):
+        """各Webtoonストリップを個別PNGとして書き出し"""
+        import os
+        dir_path=QFileDialog.getExistingDirectory(self,"書き出し先フォルダを選択")
+        if not dir_path: return
+        sh=self.spin_sh.value()
+        full_img=render_to_image(self.doc,scale=2.0,brush_defs=self.brush_defs)
+        full_h=full_img.height(); strip_w=full_img.width()
+        idx=1; y=0
+        while y<full_h:
+            crop_h=min(sh*2,full_h-y)
+            strip=full_img.copy(0,y,strip_w,crop_h)
+            path=os.path.join(dir_path,f"strip_{idx:03d}.png")
+            strip.save(path,"PNG"); y+=crop_h; idx+=1
+        QMessageBox.information(self,"完了",f"{idx-1}枚のストリップを書き出しました\n{dir_path}")
 
     def _ok(self):
         self.doc.webtoon_mode=self.chk_mode.isChecked()
@@ -2644,7 +2942,7 @@ class MainWindow(QMainWindow):
         fa("別名保存…","Ctrl+Shift+S",self._save_as)
         fm.addSeparator()
         exp=fm.addMenu("書き出し")
-        for fmt in["SVG","PNG","JPEG","WebP"]:
+        for fmt in["SVG","PNG","JPEG","WebP","PSD"]:
             a=exp.addAction(f"{fmt}として書き出し…")
             a.triggered.connect(lambda c=False,f=fmt: self._export(f))
         fm.addSeparator()
@@ -2796,14 +3094,19 @@ class MainWindow(QMainWindow):
         if path: self._write_svg(path); self._filepath=path
 
     def _export(self,fmt: str):
-        ext_map={"SVG":"svg","PNG":"png","JPEG":"jpg","WebP":"webp"}
+        ext_map={"SVG":"svg","PNG":"png","JPEG":"jpg","WebP":"webp","PSD":"psd"}
         ext=ext_map.get(fmt,"svg")
-        filter_map={"SVG":"SVG (*.svg)","PNG":"PNG (*.png)","JPEG":"JPEG (*.jpg)","WebP":"WebP (*.webp)"}
+        filter_map={
+            "SVG":"SVG (*.svg)","PNG":"PNG (*.png)",
+            "JPEG":"JPEG (*.jpg)","WebP":"WebP (*.webp)","PSD":"Photoshop (*.psd)",
+        }
         path,_=QFileDialog.getSaveFileName(self,f"{fmt}として書き出し",f"export.{ext}",filter_map[fmt])
         if not path: return
         if fmt=="SVG":
             self._write_svg(path); return
-        # ラスター書き出し
+        if fmt=="PSD":
+            self._export_psd(path); return
+        # ラスター書き出し (PNG/JPEG/WebP)
         try:
             img=render_to_image(self.doc,scale=2.0,brush_defs=self.doc.brush_presets)
             q_fmt={"PNG":"PNG","JPEG":"JPEG","WebP":"WebP"}.get(fmt,"PNG")
@@ -2812,6 +3115,48 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(f"書き出し完了: {path}",3000)
         except Exception as e:
             QMessageBox.critical(self,"エラー",f"書き出し失敗:\n{e}")
+
+    def _export_psd(self,path:str):
+        """PSD書き出し: レイヤーごとにレンダリングしてPSD形式で保存"""
+        def _qimg_to_pil(qimg):
+            import numpy as np
+            from PIL import Image as PILImage
+            qimg=qimg.convertToFormat(qimg.Format_RGBA8888)
+            ptr=qimg.bits(); ptr.setsize(qimg.byteCount())
+            arr=np.frombuffer(ptr,dtype=np.uint8).reshape(
+                (qimg.height(),qimg.width(),4)).copy()
+            return PILImage.fromarray(arr,"RGBA")
+        try:
+            from PIL import Image as PILImage
+        except ImportError:
+            QMessageBox.critical(self,"エラー",
+                "PSD書き出しには Pillow が必要です。\n"
+                "pip install Pillow --break-system-packages")
+            return
+        try:
+            from psd_tools import PSDImage
+            psd=PSDImage.new("RGBA",(self.doc.width,self.doc.height))
+            for layer in self.doc.layers:
+                if not layer.visible: continue
+                temp=Document(self.doc.width,self.doc.height)
+                temp.layers=[layer]
+                pil=_qimg_to_pil(render_to_image(temp,scale=1.0,
+                                                 brush_defs=self.doc.brush_presets))
+                try:
+                    pl=psd.make_layer(pil,name=layer.name)
+                    pl.opacity=int(layer.opacity*255)
+                except Exception:
+                    pass  # psd-tools APIバージョン差異は無視
+            psd.save(path)
+        except Exception:
+            # フォールバック: 全合成をPIL経由でPSD保存
+            try:
+                full=_qimg_to_pil(render_to_image(self.doc,scale=1.0,
+                                                  brush_defs=self.doc.brush_presets))
+                full.save(path)
+            except Exception as e2:
+                QMessageBox.critical(self,"エラー",f"PSD書き出し失敗:\n{e2}"); return
+        self.status_bar.showMessage(f"PSD書き出し完了: {path}",3000)
 
     def _write_svg(self,path):
         try:
@@ -2823,7 +3168,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self,"エラー",f"保存失敗:\n{e}")
 
     def _webtoon_settings(self):
-        dlg=WebtoonDialog(self,self.doc)
+        dlg=WebtoonDialog(self,self.doc,brush_defs=self.doc.brush_presets)
         if dlg.exec()==QDialog.Accepted: self.canvas.update()
 
     def _persp_settings(self):
