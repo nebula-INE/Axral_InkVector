@@ -1423,9 +1423,10 @@ class Canvas(QWidget):
             ax=end.x()-math.cos(angle+a_off)*ah
             ay=end.y()-math.sin(angle+a_off)*ah
             p.drawLine(end,QPointF(ax,ay))
-        # 方向ラベル (簡略化)
-        if abs(dy)>abs(dx): lbl="↓" if dy>0 else "↑"
-        else:               lbl="→" if dx>0 else "←"
+        # 方向ラベル (Fix8: abs評価を変数化して一度だけ計算)
+        vertical=(abs(dy)>abs(dx))
+        if vertical: lbl="↓" if dy>0 else "↑"
+        else:        lbl="→" if dx>0 else "←"
         p.setPen(QPen(c,1)); p.setFont(QFont("monospace",14,QFont.Bold))
         p.drawText(QPointF(end.x()+10,end.y()-10), lbl)
 
@@ -1513,39 +1514,41 @@ class Canvas(QWidget):
     def tabletEvent(self,ev):
         """スタイラス筆圧・傾き対応。筆圧を _tablet_pressure に記録しマウスイベントへ転送"""
         from PySide6.QtGui import QTabletEvent
-        self._is_tablet=True
-        self._tablet_pressure=max(0.0,min(1.0,ev.pressure()))
-        # タブレットイベントをマウスイベントとして処理（ツール動作を共有）
-        ev.accept()
-        pos=ev.position()
-        dp=self.to_doc(pos)
         from PySide6.QtCore import QEvent
         etype=ev.type()
+        # Fix2: ProximityLeave でスタイラスが離れたら _is_tablet をリセット
+        if etype==QEvent.TabletLeaveProximity:
+            self._is_tablet=False; ev.accept(); return
+        self._is_tablet=True
+        self._tablet_pressure=max(0.0,min(1.0,ev.pressure()))
+        ev.accept()
+        pos=ev.position(); dp=self.to_doc(pos)
         if etype==QEvent.TabletPress:
-            if   self.tool==TOOL_PEN:      self._pen_press(dp)
-            elif self.tool==TOOL_RESHAPE:  self._reshape_press(dp)
-            elif self.tool==TOOL_SELECT:   self._select_press(pos,dp,ev.modifiers())
-            elif self.tool==TOOL_ERASER:   self._eraser_press(dp)
-            elif self.tool==TOOL_ADD_NODE: self._add_node_press(dp)
-            elif self.tool==TOOL_DEL_NODE: self._del_node_press(dp)
-            elif self.tool==TOOL_WIDTH:    self._width_press(dp)
-            elif self.tool==TOOL_BUCKET:   self._bucket_press(dp)
-            elif self.tool==TOOL_BALLOON:  self._balloon_press(dp)
-            elif self.tool==TOOL_PANEL:    self._panel_press(dp)
+            if   self.tool==TOOL_PEN:        self._pen_press(dp)
+            elif self.tool==TOOL_RESHAPE:    self._reshape_press(dp)
+            elif self.tool==TOOL_SELECT:     self._select_press(pos,dp,ev.modifiers())
+            elif self.tool==TOOL_ERASER:     self._eraser_press(dp)
+            elif self.tool==TOOL_ADD_NODE:   self._add_node_press(dp)
+            elif self.tool==TOOL_DEL_NODE:   self._del_node_press(dp)
+            elif self.tool==TOOL_WIDTH:      self._width_press(dp)
+            elif self.tool==TOOL_BUCKET:     self._bucket_press(dp)
+            elif self.tool==TOOL_SCISSORS:   self._scissors_press(dp)   # Fix1: 追加
+            elif self.tool==TOOL_BALLOON:    self._balloon_press(dp)
+            elif self.tool==TOOL_PANEL:      self._panel_press(dp)
             elif self.tool==TOOL_FOCUS_LINE: self._focus_press(dp)
             elif self.tool==TOOL_SPEED_LINE: self._speed_press(dp)
         elif etype==QEvent.TabletMove:
             if   self.tool==TOOL_PEN:
                 dp_snap=get_persp_snap(self.doc,dp,snap_radius=20/self._scale)
                 self._pen_drag(dp_snap)
-            elif self.tool==TOOL_RESHAPE:  self._reshape_drag(dp)
-            elif self.tool==TOOL_SELECT:   self._select_drag(pos,dp)
-            elif self.tool==TOOL_WIDTH:    self._width_drag(dp)
-            elif self.tool==TOOL_BALLOON:  self._balloon_drag(dp)
-            elif self.tool==TOOL_PANEL:    self._panel_drag(dp)
+            elif self.tool==TOOL_RESHAPE:    self._reshape_drag(dp)
+            elif self.tool==TOOL_SELECT:     self._select_drag(pos,dp)
+            elif self.tool==TOOL_WIDTH:      self._width_drag(dp)
+            elif self.tool==TOOL_BALLOON:    self._balloon_drag(dp)
+            elif self.tool==TOOL_PANEL:      self._panel_drag(dp)
             elif self.tool==TOOL_SPEED_LINE: self._speed_drag(dp)
             self._update_hover(dp)
-        elif etype in(QEvent.TabletRelease,):
+        elif etype==QEvent.TabletRelease:
             if   self.tool==TOOL_PEN:        self._pen_release(dp)
             elif self.tool==TOOL_RESHAPE:    self._reshape_release(dp)
             elif self.tool==TOOL_SELECT:     self._select_release(dp)
@@ -1556,6 +1559,7 @@ class Canvas(QWidget):
             elif self.tool==TOOL_SPEED_LINE: self._speed_release(dp)
 
     def mousePressEvent(self,ev):
+        self._is_tablet=False  # Fix2: マウスイベントではスタイラスフラグをリセット
         pos=ev.position(); dp=self.to_doc(pos)
         if ev.button()==Qt.MiddleButton or (ev.button()==Qt.LeftButton and ev.modifiers()&Qt.AltModifier):
             self._pan_start=pos; self._pan_off=QPointF(self._offset); self.setCursor(Qt.ClosedHandCursor); return
@@ -1578,6 +1582,7 @@ class Canvas(QWidget):
             self._show_context_menu(ev.globalPosition().toPoint())
 
     def mouseMoveEvent(self,ev):
+        self._is_tablet=False  # Fix2: マウスイベントではスタイラスフラグをリセット
         pos=ev.position(); dp=self.to_doc(pos)
         if self._pan_start:
             self._offset=self._pan_off+(pos-self._pan_start); self.update(); return
@@ -2041,8 +2046,10 @@ class Canvas(QWidget):
         border_w=getattr(self,'_panel_border_w',3.0)
         rect=QRectF(start,dp).normalized()
         line_len=QLineF(start,dp).length()
-        # ドラッグが細長い(aspect>4)か短形か で分割/新規を切り替え
-        is_split_line=(rect.width()<15 or rect.height()<15) and line_len>20
+        # Fix5: 角度ベース判定 — 短辺/長辺 < 0.25 を「線」と判定（斜め分割に対応）
+        rect_w=max(rect.width(),0.001); rect_h=max(rect.height(),0.001)
+        aspect_ratio=min(rect_w,rect_h)/max(rect_w,rect_h)
+        is_split_line=(aspect_ratio<0.25) and line_len>20
         if is_split_line:
             # 既存のコマパスを線で分割
             split_done=False
@@ -2450,20 +2457,26 @@ class WebtoonDialog(QDialog):
         self.preview.refresh(self.brush_defs)
 
     def _export_strips(self):
-        """各Webtoonストリップを個別PNGとして書き出し"""
+        """各Webtoonストリップを個別PNGとして書き出し (Fix7: spin_scale 連動倍率)"""
         import os
         dir_path=QFileDialog.getExistingDirectory(self,"書き出し先フォルダを選択")
         if not dir_path: return
         sh=self.spin_sh.value()
-        full_img=render_to_image(self.doc,scale=2.0,brush_defs=self.brush_defs)
+        # Fix7: プレビュー倍率×4 を書き出し解像度倍率として使用
+        export_scale=max(0.5, min(4.0, self.spin_scale.value()*4))
+        full_img=render_to_image(self.doc,scale=export_scale,brush_defs=self.brush_defs)
         full_h=full_img.height(); strip_w=full_img.width()
+        sh_px=max(1, int(sh*export_scale))  # ストリップ高さをピクセルに換算
         idx=1; y=0
         while y<full_h:
-            crop_h=min(sh*2,full_h-y)
+            crop_h=min(sh_px,full_h-y)
+            if crop_h<=0: break
             strip=full_img.copy(0,y,strip_w,crop_h)
             path=os.path.join(dir_path,f"strip_{idx:03d}.png")
             strip.save(path,"PNG"); y+=crop_h; idx+=1
-        QMessageBox.information(self,"完了",f"{idx-1}枚のストリップを書き出しました\n{dir_path}")
+        QMessageBox.information(self,"完了",
+            f"{idx-1}枚のストリップを書き出しました\n"
+            f"解像度: {strip_w}×{sh_px}px  |  倍率: ×{export_scale:.1f}\n{dir_path}")
 
     def _ok(self):
         self.doc.webtoon_mode=self.chk_mode.isChecked()
@@ -3122,7 +3135,7 @@ class MainWindow(QMainWindow):
             import numpy as np
             from PIL import Image as PILImage
             qimg=qimg.convertToFormat(qimg.Format_RGBA8888)
-            ptr=qimg.bits(); ptr.setsize(qimg.byteCount())
+            ptr=qimg.bits(); ptr.setsize(qimg.sizeInBytes())  # Fix3: byteCount→sizeInBytes
             arr=np.frombuffer(ptr,dtype=np.uint8).reshape(
                 (qimg.height(),qimg.width(),4)).copy()
             return PILImage.fromarray(arr,"RGBA")
@@ -3135,18 +3148,30 @@ class MainWindow(QMainWindow):
             return
         try:
             from psd_tools import PSDImage
+            from psd_tools.constants import ColorMode
             psd=PSDImage.new("RGBA",(self.doc.width,self.doc.height))
+            added=False
             for layer in self.doc.layers:
                 if not layer.visible: continue
                 temp=Document(self.doc.width,self.doc.height)
                 temp.layers=[layer]
                 pil=_qimg_to_pil(render_to_image(temp,scale=1.0,
                                                  brush_defs=self.doc.brush_presets))
+                # Fix4: make_layer より安定した PixelLayer API を優先使用
                 try:
-                    pl=psd.make_layer(pil,name=layer.name)
+                    from psd_tools.api.layers import PixelLayer
+                    pl=PixelLayer.from_pil_image(pil,layer.name)
                     pl.opacity=int(layer.opacity*255)
+                    psd.append(pl); added=True
                 except Exception:
-                    pass  # psd-tools APIバージョン差異は無視
+                    # 最終フォールバック: make_layer (古いAPI)
+                    try:
+                        pl=psd.make_layer(pil,name=layer.name)
+                        pl.opacity=int(layer.opacity*255); added=True
+                    except Exception:
+                        pass  # このレイヤーはスキップ
+            if not added:
+                raise RuntimeError("レイヤーを追加できませんでした")
             psd.save(path)
         except Exception:
             # フォールバック: 全合成をPIL経由でPSD保存
