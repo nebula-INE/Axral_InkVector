@@ -51,7 +51,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QComboBox, QDialog, QDialogButtonBox, QLineEdit,
     QCheckBox, QTabWidget, QSizePolicy, QScrollArea, QFrame,
     QMenu, QInputDialog, QRadioButton, QButtonGroup, QGridLayout,
-    QScrollBar,
+    QScrollBar, QTextEdit,
 )
 from PySide6.QtGui import (
     QPainter, QPainterPath, QPen, QBrush, QColor, QAction,
@@ -305,6 +305,11 @@ class VPath:
         self.gradient_angle=0.0
         # トーン
         self.tone_type=TONE_NONE; self.tone_freq=20.0; self.tone_size=3.0
+        # テキスト (フキダシ内テキスト)
+        self.text:str=""                        # テキスト内容
+        self.text_size:float=14.0               # フォントサイズ (px)
+        self.text_color:QColor=QColor("#000000")
+        self.text_align:str="center"            # left / center / right
         # メタ (フキダシ/コマなど)
         self.meta: Dict[str,Any]={}
 
@@ -369,6 +374,8 @@ class VPath:
         vp.gradient_start=QColor(self.gradient_start); vp.gradient_end=QColor(self.gradient_end)
         vp.gradient_angle=self.gradient_angle
         vp.tone_type=self.tone_type; vp.tone_freq=self.tone_freq; vp.tone_size=self.tone_size
+        vp.text=self.text; vp.text_size=self.text_size
+        vp.text_color=QColor(self.text_color); vp.text_align=self.text_align
         vp.meta=dict(self.meta)
         return vp
 
@@ -577,7 +584,31 @@ def _vpath_to_el(parent,vp:VPath):
         attrs["data-grad-angle"]=str(vp.gradient_angle)
     if vp.meta: attrs["data-meta"]=json.dumps(vp.meta)
     if not vp.visible: attrs["display"]="none"
-    ET.SubElement(parent,"path",attrs)
+    path_el=ET.SubElement(parent,"path",attrs)
+    # テキストがある場合は <text> 要素をグループ内に追加
+    if vp.text and vp.meta.get("type")=="balloon":
+        br=vp.bounding_rect()
+        cx=br.x()+br.width()/2; cy=br.y()+br.height()/2
+        align_map={"left":"start","center":"middle","right":"end"}
+        text_el=ET.SubElement(parent,"text",{
+            "x":f"{cx:.2f}","y":f"{cy:.2f}",
+            "font-size":str(vp.text_size),
+            "fill":_col(vp.text_color),
+            "text-anchor":align_map.get(vp.text_align,"middle"),
+            "dominant-baseline":"middle",
+            "data-balloon-text":"1",
+            "data-path-ref":f"path-{vp.id}",
+        })
+        # 改行対応: <tspan> で行分割
+        lines=vp.text.split("\n")
+        lh=vp.text_size*1.3
+        offset_y=-(len(lines)-1)/2*lh
+        for i,line in enumerate(lines):
+            tspan=ET.SubElement(text_el,"tspan",{
+                "x":f"{cx:.2f}",
+                "dy":f"{offset_y+i*lh:.2f}" if i==0 else f"{lh:.2f}",
+            })
+            tspan.text=line
 
 def svg_to_document(svg_text: str) -> Document:
     root=ET.fromstring(svg_text.encode())
@@ -599,11 +630,32 @@ def svg_to_document(svg_text: str) -> Document:
         layer.blend=g_el.get("data-blend","通常")
         layer.visible=g_el.get("display","")!="none"
         layer.locked=g_el.get("data-locked","0")=="1"
+        # path_id → VPath マップ (テキスト反映用)
+        path_map: Dict[str,VPath]={}
         for child in g_el:
             tag=sn(child.tag)
             if tag=="path":
                 vp=parse_path_el(child)
-                if vp: layer.items.append(vp)
+                if vp:
+                    layer.items.append(vp)
+                    path_map[child.get("id","")]=vp
+            elif tag=="text":
+                # <text data-balloon-text="1"> → 対応するVPathにテキストを反映
+                if child.get("data-balloon-text")=="1":
+                    ref_id=child.get("data-path-ref","")
+                    target_vp=path_map.get(ref_id)
+                    if target_vp:
+                        # <tspan> から行を結合
+                        lines=[]
+                        for tspan in child:
+                            lines.append(tspan.text or "")
+                        target_vp.text="\n".join(lines)
+                        try: target_vp.text_size=float(child.get("font-size","14"))
+                        except: pass
+                        fill=child.get("fill","#000000")
+                        if fill!="none": target_vp.text_color=QColor(fill)
+                        anchor=child.get("text-anchor","middle")
+                        target_vp.text_align={"start":"left","middle":"center","end":"right"}.get(anchor,"center")
             elif tag=="g":
                 if child.get("data-group")=="1":
                     grp=VGroup(child.get("data-name","グループ"))
@@ -1184,6 +1236,19 @@ def _render_path(painter: QPainter, vp: VPath, brush_defs: Dict):
         painter.fillPath(qpath,QBrush(vp.fill_color))
     apply_brush_stroke(painter,vp,brush_defs)
     draw_tone(painter,vp)
+    # フキダシテキスト (PNG/JPEG/WebP書き出し対応)
+    if vp.text and vp.meta.get("type")=="balloon":
+        br=vp.bounding_rect()
+        cx=br.x()+br.width()/2; cy=br.y()+br.height()/2
+        font=QFont("Hiragino Kaku Gothic Pro,Meiryo,sans-serif")
+        font.setPixelSize(max(4,int(vp.text_size)))
+        painter.setFont(font); painter.setPen(QPen(vp.text_color))
+        lines=vp.text.split("\n"); lh=vp.text_size*1.3; total_h=(len(lines)-1)*lh
+        align_flag={"left":Qt.AlignLeft,"center":Qt.AlignHCenter,"right":Qt.AlignRight}.get(vp.text_align,Qt.AlignHCenter)
+        for i,line in enumerate(lines):
+            y=cy-total_h/2+i*lh
+            painter.drawText(QRectF(br.x()+4,y-vp.text_size,br.width()-8,vp.text_size*1.5),
+                             align_flag|Qt.AlignVCenter,line)
     painter.setOpacity(1.0)
 
 # ══════════════════════════════════════════════════════════════
@@ -1229,9 +1294,15 @@ class Canvas(QWidget):
         # 線幅
         self._width_old=2.0
         # スタイラス筆圧
-        self._tablet_pressure=1.0   # 現在の筆圧 (0.0-1.0)
-        self._is_tablet=False       # タブレットデバイス使用中フラグ
+        self._tablet_pressure=1.0
+        self._is_tablet=False
         self.setAttribute(Qt.WA_TabletTracking, True)
+        # タッチジェスチャー (2本指Undo/ピンチズーム)
+        self._touch_pts: Dict[int,QPointF]={}   # touch_id → 最新位置
+        self._pinch_dist0: Optional[float]=None  # ピンチ開始距離
+        self._pinch_scale0: float=1.0            # ピンチ開始時のスケール
+        self._swipe_start_pts: Dict[int,QPointF]={} # スワイプ開始位置
+        self.setAttribute(Qt.WA_AcceptTouchEvents, True)
         self.setMinimumSize(400,300)
 
     def to_doc(self,p): return QPointF((p.x()-self._offset.x())/self._scale,(p.y()-self._offset.y())/self._scale)
@@ -1387,6 +1458,9 @@ class Canvas(QWidget):
             p.setPen(glow); p.setBrush(Qt.NoBrush); p.drawPath(qpath)
             hi=QPen(QColor(C["accent"]),max(vp.stroke_width+2,3),Qt.SolidLine,Qt.RoundCap)
             p.setPen(hi); p.drawPath(qpath)
+        # フキダシテキスト描画
+        if vp.text and vp.meta.get("type")=="balloon" and not preview:
+            self._draw_balloon_text(p, vp)
         p.setOpacity(1.0)
 
     def _draw_balloon_preview(self,p):
@@ -1404,6 +1478,24 @@ class Canvas(QWidget):
         p.setPen(QPen(c,3,Qt.DashLine)); p.setBrush(QColor(C["accent"]+"11"))
         start=self._panel_start; end=self._panel_cur
         p.drawRect(QRectF(start,end).normalized())
+
+    def _draw_balloon_text(self, p: QPainter, vp: VPath):
+        """フキダシ内テキストをキャンバス座標で描画（改行対応）"""
+        if not vp.text: return
+        br=vp.bounding_rect()
+        cx=br.x()+br.width()/2; cy=br.y()+br.height()/2
+        font=QFont("Hiragino Kaku Gothic Pro,Meiryo,Yu Gothic,sans-serif")
+        font.setPixelSize(max(4,int(vp.text_size)))
+        p.setFont(font)
+        p.setPen(QPen(vp.text_color))
+        lines=vp.text.split("\n")
+        lh=vp.text_size*1.3
+        total_h=(len(lines)-1)*lh
+        align_flag={"left":Qt.AlignLeft,"center":Qt.AlignHCenter,"right":Qt.AlignRight}.get(vp.text_align,Qt.AlignHCenter)
+        for i,line in enumerate(lines):
+            y=cy-total_h/2+i*lh
+            text_rect=QRectF(br.x()+4, y-vp.text_size, br.width()-8, vp.text_size*1.5)
+            p.drawText(text_rect, align_flag|Qt.AlignVCenter, line)
 
     def _draw_speed_preview(self,p):
         """Fix2: 効果線ドラッグ中の方向矢印プレビュー（スクリーン座標）"""
@@ -1511,6 +1603,73 @@ class Canvas(QWidget):
         return {vp:[(QPointF(n.pos),QPointF(n.cp_in),QPointF(n.cp_out)) for n in vp.nodes] for vp in self.selected}
 
     # ─── マウス ───
+    def event(self, ev):
+        """touchEvent は event() でハンドルする必要がある (Qt6)"""
+        from PySide6.QtCore import QEvent
+        if ev.type() in (QEvent.TouchBegin, QEvent.TouchUpdate, QEvent.TouchEnd,
+                          QEvent.TouchCancel):
+            self._handle_touch(ev)
+            return True
+        return super().event(ev)
+
+    def _handle_touch(self, ev):
+        """2本指ジェスチャー: ピンチズーム / 2本指スワイプでUndo/Redo"""
+        from PySide6.QtCore import QEvent
+        points=ev.points()
+        etype=ev.type()
+
+        if etype==QEvent.TouchBegin:
+            self._touch_pts={}; self._swipe_start_pts={}
+            self._pinch_dist0=None
+            for pt in points:
+                self._touch_pts[pt.id()]=pt.position()
+                self._swipe_start_pts[pt.id()]=pt.position()
+            if len(points)==2:
+                p1,p2=points[0].position(),points[1].position()
+                self._pinch_dist0=QLineF(p1,p2).length()
+                self._pinch_scale0=self._scale
+            ev.accept(); return
+
+        if etype==QEvent.TouchUpdate:
+            for pt in points:
+                self._touch_pts[pt.id()]=pt.position()
+            if len(points)==2 and self._pinch_dist0 and self._pinch_dist0>1:
+                p1,p2=points[0].position(),points[1].position()
+                dist=QLineF(p1,p2).length()
+                factor=dist/self._pinch_dist0
+                # ピンチ中心を軸にズーム
+                pivot=QPointF((p1.x()+p2.x())/2,(p1.y()+p2.y())/2)
+                new_scale=max(0.02,min(self._pinch_scale0*factor,64.0))
+                ratio=new_scale/self._scale
+                self._offset=QPointF(
+                    pivot.x()-(pivot.x()-self._offset.x())*ratio,
+                    pivot.y()-(pivot.y()-self._offset.y())*ratio,
+                )
+                self._scale=new_scale; self.update()
+            ev.accept(); return
+
+        if etype in (QEvent.TouchEnd, QEvent.TouchCancel):
+            if len(self._swipe_start_pts)==2 and self._pinch_dist0:
+                # ピンチをほぼしていない場合はスワイプ判定
+                p1,p2=points[0].position(),points[1].position()
+                end_dist=QLineF(p1,p2).length()
+                zoom_ratio=end_dist/max(self._pinch_dist0,1)
+                if 0.85<zoom_ratio<1.15:
+                    # ズームしていない → スワイプ方向でUndo/Redo
+                    ids=list(self._swipe_start_pts.keys())
+                    if len(ids)>=2:
+                        start_avg_x=sum(self._swipe_start_pts[i].x() for i in ids[:2])/2
+                        end_avg_x=sum(self._touch_pts.get(i,self._swipe_start_pts[i]).x() for i in ids[:2])/2
+                        dx=end_avg_x-start_avg_x
+                        if abs(dx)>40:   # 40px以上の水平スワイプ
+                            if dx<0:     # 左スワイプ → Undo
+                                if self.undo.canUndo(): self.undo.undo()
+                            else:        # 右スワイプ → Redo
+                                if self.undo.canRedo(): self.undo.redo()
+                            self.update()
+            self._touch_pts={}; self._swipe_start_pts={}; self._pinch_dist0=None
+            ev.accept(); return
+
     def tabletEvent(self,ev):
         """スタイラス筆圧・傾き対応。筆圧を _tablet_pressure に記録しマウスイベントへ転送"""
         from PySide6.QtGui import QTabletEvent
@@ -1621,6 +1780,12 @@ class Canvas(QWidget):
         if self.tool==TOOL_PEN: self._pen_finish()
         elif self.tool==TOOL_RESHAPE and self.selected:
             self.selected[0].closed=not self.selected[0].closed; self.update()
+        elif self.tool in (TOOL_SELECT, TOOL_BALLOON):
+            # フキダシをダブルクリックでテキスト再編集
+            dp=self.to_doc(ev.position())
+            hit=self._hit_paths(dp)
+            if hit and hit.meta.get("type")=="balloon":
+                self._open_balloon_text_dialog(hit)
 
     def wheelEvent(self,ev):
         f=1.12 if ev.angleDelta().y()>0 else 1/1.12; pv=ev.position()
@@ -2032,6 +2197,15 @@ class Canvas(QWidget):
         self.selected=[vp]; self.selection_changed.emit(self.selected)
         self.document_changed.emit()
         self._balloon_start=None; self.update()
+        # テキスト入力ダイアログを即座に表示
+        self._open_balloon_text_dialog(vp)
+
+    def _open_balloon_text_dialog(self, vp: VPath):
+        """フキダシのテキストを編集するダイアログを開く"""
+        from PySide6.QtWidgets import QDialog
+        dlg=BalloonTextDialog(self.window(), vp)
+        if dlg.exec()==QDialog.Accepted:
+            self.document_changed.emit(); self.update()
 
     # ─── コマ割り ───
     def _panel_press(self,dp):
@@ -2374,6 +2548,73 @@ class BrushStudioDialog(QDialog):
 # ══════════════════════════════════════════════════════════════
 #  Webtoonダイアログ
 # ══════════════════════════════════════════════════════════════
+class BalloonTextDialog(QDialog):
+    """フキダシのテキスト・フォントサイズ・色・整列を編集するダイアログ"""
+    def __init__(self, parent, vp: VPath):
+        super().__init__(parent)
+        self.vp=vp
+        self.setWindowTitle("フキダシテキスト編集")
+        self.setMinimumWidth(360)
+        self._build()
+
+    def _build(self):
+        lay=QVBoxLayout(self); lay.setSpacing(8)
+
+        # テキスト入力エリア
+        lay.addWidget(QLabel("テキスト（Enterで改行）"))
+        self.text_edit=QTextEdit()
+        self.text_edit.setPlainText(self.vp.text)
+        self.text_edit.setMinimumHeight(100)
+        self.text_edit.setStyleSheet(f"""
+            QTextEdit {{
+                background:{C['surface']};border:1px solid {C['border']};
+                border-radius:4px;color:{C['fg']};font-size:14px;padding:6px;
+            }}
+        """)
+        lay.addWidget(self.text_edit)
+
+        # フォントサイズ・色・整列
+        opts=QGroupBox("スタイル"); og=QGridLayout(opts)
+        og.addWidget(QLabel("フォントサイズ"),0,0)
+        self.spin_size=QDoubleSpinBox(); self.spin_size.setRange(4,120)
+        self.spin_size.setValue(self.vp.text_size); og.addWidget(self.spin_size,0,1)
+
+        og.addWidget(QLabel("文字色"),1,0)
+        self.btn_color=QPushButton()
+        self.btn_color.setFixedHeight(26)
+        self._update_color_btn()
+        self.btn_color.clicked.connect(self._pick_color)
+        og.addWidget(self.btn_color,1,1)
+
+        og.addWidget(QLabel("整列"),2,0)
+        self.combo_align=QComboBox()
+        for a in["left","center","right"]: self.combo_align.addItem(a)
+        self.combo_align.setCurrentText(self.vp.text_align)
+        og.addWidget(self.combo_align,2,1)
+        lay.addWidget(opts)
+
+        # OK / Cancel
+        btns=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
+        btns.accepted.connect(self._ok); btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+    def _update_color_btn(self):
+        c=self.vp.text_color
+        self.btn_color.setStyleSheet(
+            f"background:{c.name()};border:1px solid {C['border']};border-radius:4px;")
+
+    def _pick_color(self):
+        c=QColorDialog.getColor(self.vp.text_color, self, "文字色")
+        if c.isValid():
+            self.vp.text_color=c; self._update_color_btn()
+
+    def _ok(self):
+        self.vp.text=self.text_edit.toPlainText()
+        self.vp.text_size=self.spin_size.value()
+        self.vp.text_align=self.combo_align.currentText()
+        self.accept()
+
+
 class WebtoonPreviewWidget(QWidget):
     """Webtoonストリップをスクロール表示するプレビューウィジェット"""
     def __init__(self,doc:Document,parent=None):
@@ -2659,7 +2900,12 @@ class PropsPanel(QWidget):
         op_r.addWidget(self.sl_op,1); op_r.addWidget(self.lbl_op); ogl.addLayout(op_r)
         self.btn_close_path=QPushButton("パスを閉じる / 開く")
         self.btn_close_path.clicked.connect(self._toggle_close)
-        t1l.addWidget(sg); t1l.addWidget(fg); t1l.addWidget(og); t1l.addWidget(self.btn_close_path); t1l.addStretch()
+        self.btn_edit_text=QPushButton("💬 テキストを編集…")
+        self.btn_edit_text.setObjectName("accent")
+        self.btn_edit_text.clicked.connect(self._edit_text)
+        t1l.addWidget(sg); t1l.addWidget(fg); t1l.addWidget(og)
+        t1l.addWidget(self.btn_close_path); t1l.addWidget(self.btn_edit_text)
+        t1l.addStretch()
         tabs.addTab(t1,"スタイル")
         # ── トーン ──
         t2=QWidget(); t2l=QVBoxLayout(t2); t2l.setSpacing(6)
@@ -2731,6 +2977,18 @@ class PropsPanel(QWidget):
         self.lbl_info.setText(f"ノード数: {len(vp.nodes)}\n状態: {'閉じたパス' if vp.closed else '開いたパス'}\nブラシ: {vp.brush_name}\nX:{br.x():.1f}  Y:{br.y():.1f}\nW:{br.width():.1f}  H:{br.height():.1f}")
         for spin,val in[(self._tx_spin,br.x()),(self._ty_spin,br.y()),(self._tw_spin,br.width()),(self._th_spin,br.height())]:
             spin.blockSignals(True); spin.setValue(val); spin.blockSignals(False)
+
+        # テキスト編集ボタンはフキダシのみ表示
+        is_balloon=bool(paths) and paths[0].meta.get("type")=="balloon"
+        self.btn_edit_text.setVisible(is_balloon)
+
+    def _edit_text(self):
+        if not self._paths: return
+        vp=self._paths[0]
+        if vp.meta.get("type")!="balloon": return
+        dlg=BalloonTextDialog(self, vp)
+        if dlg.exec()==QDialog.Accepted:
+            self.canvas.update(); self.changed.emit()
 
     def _pick_stroke(self):
         if not self._paths: return
