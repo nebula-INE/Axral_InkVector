@@ -90,7 +90,6 @@ C = {
 }
 
 SS = f"""
-* {{ box-sizing: border-box; }}
 QMainWindow, QWidget {{
     background:{C['bg']}; color:{C['fg']};
     font-family:'Inter','Hiragino Kaku Gothic Pro','Meiryo','Yu Gothic UI',sans-serif;
@@ -168,6 +167,7 @@ TOOL_DEL_NODE   = "del_node"
 TOOL_WIDTH      = "width"
 TOOL_BUCKET     = "bucket"
 TOOL_SCISSORS   = "scissors"
+TOOL_TRIM       = "trim"       # 交差点消しゴム
 TOOL_BALLOON    = "balloon"   # フキダシ
 TOOL_PANEL      = "panel"     # コマ割り
 TOOL_FOCUS_LINE = "focus"     # 集中線
@@ -303,6 +303,9 @@ class VPath:
         self.gradient_enabled=False
         self.gradient_start=QColor("#5B8CFF"); self.gradient_end=QColor("#A78BFA")
         self.gradient_angle=0.0
+        # カラーメッシュ (行×列のカラーグリッドを滑らかに補間)
+        self.mesh_enabled=False; self.mesh_cols=3; self.mesh_rows=3
+        self.mesh_colors:List[QColor]=[]
         # トーン
         self.tone_type=TONE_NONE; self.tone_freq=20.0; self.tone_size=3.0
         # テキスト (フキダシ内テキスト)
@@ -373,6 +376,8 @@ class VPath:
         vp.gradient_enabled=self.gradient_enabled
         vp.gradient_start=QColor(self.gradient_start); vp.gradient_end=QColor(self.gradient_end)
         vp.gradient_angle=self.gradient_angle
+        vp.mesh_enabled=self.mesh_enabled; vp.mesh_cols=self.mesh_cols; vp.mesh_rows=self.mesh_rows
+        vp.mesh_colors=[QColor(c) for c in self.mesh_colors]
         vp.tone_type=self.tone_type; vp.tone_freq=self.tone_freq; vp.tone_size=self.tone_size
         vp.text=self.text; vp.text_size=self.text_size
         vp.text_color=QColor(self.text_color); vp.text_align=self.text_align
@@ -438,6 +443,353 @@ class Document:
             for item in layer.items:
                 if isinstance(item,VGroup) and vp in item.items: return (layer,item)
         return (None,None)
+
+# ══════════════════════════════════════════════════════════════
+#  幾何ユーティリティ: 交差点消しゴム / アンカー軽量化
+# ══════════════════════════════════════════════════════════════
+from PySide6.QtWidgets import (QDialog, QSpinBox, QDoubleSpinBox, QVBoxLayout, QHBoxLayout,
+                               QGridLayout, QLabel, QPushButton, QColorDialog, QInputDialog,
+                               QDialogButtonBox, QCheckBox, QGroupBox)
+
+def _flatten_vpath(vp, steps=24):
+    """パスを折れ線化。戻り値 (点列, パラメータ列)。u = セグメント番号 + t"""
+    n=len(vp.nodes)
+    if n==0: return [],[]
+    segs=n if (vp.closed and n>=2) else n-1
+    if segs<=0: return [QPointF(vp.nodes[0].pos)],[0.0]
+    pts=[]; us=[]
+    for i in range(segs):
+        a=vp.nodes[i]; b=vp.nodes[(i+1)%n]
+        for k in range(steps if i<segs-1 else steps+1):
+            t=k/steps
+            pts.append(_cubic(a.pos,a.cp_out,b.cp_in,b.pos,t)); us.append(i+t)
+    return pts,us
+
+def _seg_x(p1,p2,p3,p4):
+    """線分 p1-p2 と p3-p4 の交点。p1-p2 上のパラメータ t を返す (なければ None)"""
+    d1x=p2.x()-p1.x(); d1y=p2.y()-p1.y(); d2x=p4.x()-p3.x(); d2y=p4.y()-p3.y()
+    den=d1x*d2y-d1y*d2x
+    if abs(den)<1e-12: return None
+    ex=p3.x()-p1.x(); ey=p3.y()-p1.y()
+    t=(ex*d2y-ey*d2x)/den; u=(ex*d1y-ey*d1x)/den
+    if 0.0<=t<=1.0 and 0.0<=u<=1.0: return t
+    return None
+
+def path_intersections(vp, others, cell=16.0):
+    """vp と others との交点のパラメータ u (昇順) を返す。空間ハッシュで高速化"""
+    pts,us=_flatten_vpath(vp)
+    if len(pts)<2: return []
+    grid={}
+    for ov in others:
+        opts,_=_flatten_vpath(ov)
+        for k in range(len(opts)-1):
+            c,d=opts[k],opts[k+1]; seg=(c,d)
+            x0,x1=sorted((c.x(),d.x())); y0,y1=sorted((c.y(),d.y()))
+            for gx in range(int(x0//cell),int(x1//cell)+1):
+                for gy in range(int(y0//cell),int(y1//cell)+1):
+                    grid.setdefault((gx,gy),[]).append(seg)
+    res=[]
+    for j in range(len(pts)-1):
+        a,b=pts[j],pts[j+1]
+        x0,x1=sorted((a.x(),b.x())); y0,y1=sorted((a.y(),b.y()))
+        seen=set()
+        for gx in range(int(x0//cell),int(x1//cell)+1):
+            for gy in range(int(y0//cell),int(y1//cell)+1):
+                for seg in grid.get((gx,gy),()):
+                    if id(seg) in seen: continue
+                    seen.add(id(seg))
+                    t=_seg_x(a,b,seg[0],seg[1])
+                    if t is not None: res.append(us[j]+(us[j+1]-us[j])*t)
+    res.sort(); merged=[]
+    for u in res:
+        if not merged or u-merged[-1]>0.02: merged.append(u)
+    return merged
+
+def _cubic_split(p0,p1,p2,p3,t):
+    q0=_lerp(p0,p1,t); q1=_lerp(p1,p2,t); q2=_lerp(p2,p3,t)
+    r0=_lerp(q0,q1,t); r1=_lerp(q1,q2,t); s_=_lerp(r0,r1,t)
+    return (p0,q0,r0,s_),(s_,r1,q2,p3)
+
+def _cubic_range(p0,p1,p2,p3,t0,t1):
+    """3次ベジェの t0..t1 区間を切り出した制御点4つ"""
+    left,_=_cubic_split(p0,p1,p2,p3,t1)
+    if t0<=1e-9: return left
+    _,right=_cubic_split(left[0],left[1],left[2],left[3],t0/t1)
+    return right
+
+def vpath_subpath(vp,u0,u1):
+    """開いたパス vp の u0..u1 区間を新しい VPath として切り出す (短すぎれば None)"""
+    n=len(vp.nodes); segs=n-1
+    if segs<1: return None
+    u0=max(0.0,u0); u1=min(float(segs),u1)
+    if u1-u0<1e-3: return None
+    i0=min(int(math.floor(u0)),segs-1); t0=u0-i0
+    if u1>=segs: i1=segs-1; t1=1.0
+    else: i1=int(math.floor(u1)); t1=u1-i1
+    out=[]; upos=[]
+    for i in range(i0,i1+1):
+        a=vp.nodes[i]; b=vp.nodes[i+1]
+        ta=t0 if i==i0 else 0.0; tb=t1 if i==i1 else 1.0
+        q0,q1,q2,q3=_cubic_range(a.pos,a.cp_out,b.cp_in,b.pos,ta,tb)
+        if not out:
+            out.append(VNode(q0,q0,q1)); upos.append(i+ta)
+        else:
+            out[-1].cp_out=QPointF(q1)
+        out.append(VNode(q3,q2,q3)); upos.append(i+tb)
+    if len(out)<2: return None
+    np_=vp.clone(); np_.nodes=out; np_.closed=False
+    if len(vp.pressure)==n:
+        def pa(u):
+            i=min(int(math.floor(u)),n-2); f=u-i
+            return vp.pressure[i]*(1-f)+vp.pressure[i+1]*f
+        np_.pressure=[pa(u) for u in upos]
+    else:
+        np_.pressure=[]
+    return np_
+
+def trim_at_intersections(vp, others, click):
+    """クリック位置を含む「隣り合う交差点まで」の区間を削除した残りのパス群を返す。
+    交差が無ければ None。残りが無ければ空リスト。"""
+    work=vp
+    if vp.closed and len(vp.nodes)>=2:
+        work=vp.clone(); work.closed=False
+        work.nodes=[n.clone() for n in vp.nodes]+[vp.nodes[0].clone()]
+        work.pressure=(list(vp.pressure)+[vp.pressure[0]]) if len(vp.pressure)==len(vp.nodes) else []
+    segs=len(work.nodes)-1
+    if segs<1: return None
+    ints=path_intersections(work,others)
+    eps=1e-3
+    if vp.closed: ints=[u for u in ints if eps<u<segs-eps]
+    if not ints: return None
+    pts,us=_flatten_vpath(work)
+    j=min(range(len(pts)),key=lambda k:(pts[k].x()-click.x())**2+(pts[k].y()-click.y())**2)
+    uc=us[j]
+    prev=max((u for u in ints if u<uc-eps),default=None)
+    nxt=min((u for u in ints if u>uc+eps),default=None)
+    pieces=[]
+    if not vp.closed:
+        if prev is not None: pieces.append(vpath_subpath(work,0.0,prev))
+        if nxt is not None:  pieces.append(vpath_subpath(work,nxt,float(segs)))
+        return [p for p in pieces if p is not None]
+    # 閉パス
+    if len(ints)<2: return None
+    if prev is not None and nxt is not None:
+        A=vpath_subpath(work,0.0,prev); B=vpath_subpath(work,nxt,float(segs))
+        if A is None or B is None: return [p for p in (A,B) if p is not None]
+        last=B.nodes[-1]; first=A.nodes[0]
+        merged=VNode(last.pos,last.cp_in,first.cp_out)
+        B.nodes=B.nodes[:-1]+[merged]+A.nodes[1:]
+        if len(B.pressure)+len(A.pressure)>0 and A.pressure and B.pressure:
+            B.pressure=B.pressure[:-1]+[(B.pressure[-1]+A.pressure[0])/2]+A.pressure[1:]
+        else: B.pressure=[]
+        return [B]
+    one=vpath_subpath(work,ints[0],ints[-1])
+    return [one] if one is not None else []
+
+def _dist_pt_seg(p,a,b):
+    dx=b.x()-a.x(); dy=b.y()-a.y(); L=dx*dx+dy*dy
+    if L<1e-12: return math.hypot(p.x()-a.x(),p.y()-a.y())
+    t=max(0.0,min(1.0,((p.x()-a.x())*dx+(p.y()-a.y())*dy)/L))
+    return math.hypot(p.x()-(a.x()+t*dx),p.y()-(a.y()+t*dy))
+
+def _dist_to_polyline(p,poly):
+    return min(_dist_pt_seg(p,poly[i],poly[i+1]) for i in range(len(poly)-1))
+
+def simplify_vpath(vp,tol=1.0):
+    """アンカー軽量化: 元の形状からの誤差が tol 以内なら順にノードを削除。
+    戻り値 (新ノード列, 新筆圧列, 削除数)。元の vp は変更しない"""
+    n0=len(vp.nodes); min_nodes=3 if vp.closed else 2
+    if n0<=min_nodes: return [n.clone() for n in vp.nodes],list(vp.pressure),0
+    nodes=[n.clone() for n in vp.nodes]
+    for o,nw in zip(vp.nodes,nodes): nw.smooth=o.smooth
+    pres=list(vp.pressure) if len(vp.pressure)==n0 else None
+    segs=n0 if vp.closed else n0-1
+    cov=[]
+    for i in range(segs):
+        a=nodes[i]; b=nodes[(i+1)%n0]
+        cov.append([_cubic(a.pos,a.cp_out,b.cp_in,b.pos,k/16) for k in range(17)])
+    removed=0
+    for _pass in range(6):
+        progress=False
+        i=0 if vp.closed else 1
+        while len(nodes)>min_nodes and i<len(nodes):
+            n=len(nodes)
+            if (not vp.closed) and i>=n-1: break
+            ip=(i-1)%n; inx=(i+1)%n
+            a=nodes[ip]; b=nodes[inx]
+            pts=cov[ip]+cov[i]
+            best=None
+            for f in (1.0,1.5,2.0):
+                co=QPointF(a.pos.x()+(a.cp_out.x()-a.pos.x())*f,a.pos.y()+(a.cp_out.y()-a.pos.y())*f)
+                ci=QPointF(b.pos.x()+(b.cp_in.x()-b.pos.x())*f,b.pos.y()+(b.cp_in.y()-b.pos.y())*f)
+                poly=[_cubic(a.pos,co,ci,b.pos,k/24) for k in range(25)]
+                err=max(_dist_to_polyline(p,poly) for p in pts)
+                if best is None or err<best[0]: best=(err,co,ci)
+            if best[0]<=tol:
+                a.cp_out=best[1]; b.cp_in=best[2]
+                cov[ip]=pts; del cov[i]; del nodes[i]
+                if pres is not None: del pres[i]
+                removed+=1; progress=True
+            else:
+                i+=1
+        if not progress: break
+    return nodes,(pres if pres is not None else []),removed
+
+class CmdReplaceNodes(QUndoCommand):
+    def __init__(self,vp,old_nodes,old_pres,new_nodes,new_pres,text="ノード置換"):
+        super().__init__(text); self.vp=vp
+        self.o=(list(old_nodes),list(old_pres)); self.n=(list(new_nodes),list(new_pres))
+    def redo(self): self.vp.nodes=list(self.n[0]); self.vp.pressure=list(self.n[1])
+    def undo(self): self.vp.nodes=list(self.o[0]); self.vp.pressure=list(self.o[1])
+
+# ══════════════════════════════════════════════════════════════
+#  カラーメッシュ
+# ══════════════════════════════════════════════════════════════
+def default_mesh_colors(cols,rows,c0,c1):
+    out=[]
+    for r in range(rows):
+        for c in range(cols):
+            t=(c/max(cols-1,1)+r/max(rows-1,1))/2
+            out.append(QColor(int(c0.red()+(c1.red()-c0.red())*t),int(c0.green()+(c1.green()-c0.green())*t),
+                              int(c0.blue()+(c1.blue()-c0.blue())*t),int(c0.alpha()+(c1.alpha()-c0.alpha())*t)))
+    return out
+
+def _mesh_sample(colors,cols,rows,u,v):
+    gx=min(max(u,0.0),1.0)*(cols-1); gy=min(max(v,0.0),1.0)*(rows-1)
+    i=min(int(gx),cols-2); j=min(int(gy),rows-2)
+    fx=gx-i; fy=gy-j; fx=fx*fx*(3-2*fx); fy=fy*fy*(3-2*fy)   # smoothstep で格子の継ぎ目を目立たなくする
+    c00=colors[j*cols+i]; c10=colors[j*cols+i+1]; c01=colors[(j+1)*cols+i]; c11=colors[(j+1)*cols+i+1]
+    def ch(f):
+        top=f(c00)*(1-fx)+f(c10)*fx; bot=f(c01)*(1-fx)+f(c11)*fx
+        return int(round(top*(1-fy)+bot*fy))
+    return ch(lambda c:c.red()),ch(lambda c:c.green()),ch(lambda c:c.blue()),ch(lambda c:c.alpha())
+
+def mesh_resample(colors,c0,r0,c1,r1):
+    return [QColor(*_mesh_sample(colors,c0,r0,c/max(c1-1,1),r/max(r1-1,1))) for r in range(r1) for c in range(c1)]
+
+def mesh_average(colors):
+    n=max(len(colors),1)
+    return QColor(sum(c.red() for c in colors)//n,sum(c.green() for c in colors)//n,sum(c.blue() for c in colors)//n)
+
+def _mesh_image(vp,res=48):
+    key=(vp.mesh_cols,vp.mesh_rows,tuple(c.rgba() for c in vp.mesh_colors))
+    cache=getattr(vp,"_mesh_cache",None)
+    if cache and cache[0]==key: return cache[1]
+    img=QImage(res,res,QImage.Format_ARGB32)
+    for y in range(res):
+        for x in range(res):
+            r,g,b,a=_mesh_sample(vp.mesh_colors,vp.mesh_cols,vp.mesh_rows,x/(res-1),y/(res-1))
+            img.setPixelColor(x,y,QColor(r,g,b,a))
+    vp._mesh_cache=(key,img)
+    return img
+
+def _draw_mesh_fill(painter,vp,qpath):
+    img=_mesh_image(vp)
+    painter.save()
+    painter.setClipPath(qpath)
+    painter.setRenderHint(QPainter.SmoothPixmapTransform,True)
+    painter.drawImage(qpath.boundingRect(),img)
+    painter.restore()
+
+# ══════════════════════════════════════════════════════════════
+#  制作アシスト (生成AIではなくルール/幾何ベースの支援)
+# ══════════════════════════════════════════════════════════════
+def suggest_palettes(base):
+    h,s,l,_a=base.getHslF()
+    if h<0: h=0.0
+    def hsl(hh,ss,ll):
+        c=QColor(); c.setHslF(hh%1.0,min(max(ss,0.0),1.0),min(max(ll,0.0),1.0)); return c
+    return {
+        "補色":[QColor(base),hsl(h+0.5,s,l)],
+        "類似色":[hsl(h-1/12,s,l),QColor(base),hsl(h+1/12,s,l)],
+        "トライアド":[QColor(base),hsl(h+1/3,s,l),hsl(h+2/3,s,l)],
+        "分割補色":[QColor(base),hsl(h+5/12,s,l),hsl(h+7/12,s,l)],
+        "明暗スケール":[hsl(h,s,l*0.45),hsl(h,s,l*0.7),QColor(base),hsl(h,s*0.9,min(l+0.15,0.95)),hsl(h,s*0.8,min(l+0.3,0.97))],
+        "アニメ塗り(影・本体・ハイライト)":[hsl(h-0.04,min(s*1.1,1.0),l*0.62),QColor(base),hsl(h+0.02,s*0.8,min(l+0.22,0.96))],
+    }
+
+def suggest_balloon_rect(doc,panel_vp,grid=8):
+    """コマ内で最も空いている領域 (右上優先=日本語の読み順) を返す"""
+    pr=panel_vp.bounding_rect()
+    cw=pr.width()/grid; ch=pr.height()/grid
+    occ=[[0.0]*grid for _ in range(grid)]
+    for layer in doc.layers:
+        if not layer.visible: continue
+        for p in layer.paths:
+            if p is panel_vp or not p.visible or p.meta.get("type")=="panel": continue
+            br=p.bounding_rect().intersected(pr)
+            if br.isEmpty(): continue
+            wgt=2.0 if p.meta.get("type")=="balloon" else 1.0
+            for gy in range(grid):
+                for gx in range(grid):
+                    if QRectF(pr.x()+gx*cw,pr.y()+gy*ch,cw,ch).intersects(br): occ[gy][gx]+=wgt
+    bw=bh=max(2,int(round(grid*0.375)))
+    best=None
+    for gy in range(0,grid-bh+1):
+        for gx in range(0,grid-bw+1):
+            score=sum(occ[y][x] for y in range(gy,gy+bh) for x in range(gx,gx+bw))
+            score+=0.01*((grid-bw-gx)+gy)      # 右上を優先
+            if best is None or score<best[0]: best=(score,gx,gy)
+    _,gx,gy=best
+    return QRectF(pr.x()+gx*cw+cw*0.15,pr.y()+gy*ch+ch*0.15,bw*cw*0.7,bh*ch*0.7)
+
+class MeshEditDialog(QDialog):
+    def __init__(self,parent,cols,rows,colors):
+        super().__init__(parent); self.setWindowTitle("メッシュ色の編集")
+        self.colors=[QColor(c) for c in colors]
+        lay=QVBoxLayout(self); grid=QGridLayout(); self._btns=[]
+        for r in range(rows):
+            for c in range(cols):
+                b=QPushButton(); b.setFixedSize(44,44)
+                b.clicked.connect(lambda _=False,i=r*cols+c:self._pick(i))
+                grid.addWidget(b,r,c); self._btns.append(b)
+        lay.addLayout(grid)
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject); lay.addWidget(bb)
+        self._refresh()
+    def _refresh(self):
+        for b,c in zip(self._btns,self.colors): b.setStyleSheet(f"background:{c.name()};border:1px solid #888;")
+    def _pick(self,i):
+        c=QColorDialog.getColor(self.colors[i],self,"メッシュ点の色",QColorDialog.ShowAlphaChannel)
+        if c.isValid(): self.colors[i]=c; self._refresh()
+
+class ColorSuggestDialog(QDialog):
+    def __init__(self,parent,base,apply_stroke,apply_fill,apply_pen):
+        super().__init__(parent); self.setWindowTitle("配色提案")
+        self._sel=QColor(base); self._cbs=(apply_stroke,apply_fill,apply_pen)
+        lay=QVBoxLayout(self)
+        lay.addWidget(QLabel("基準色から配色を提案します。色をクリックして選び、下のボタンで適用します。"))
+        for name,cols in suggest_palettes(base).items():
+            row=QHBoxLayout(); lb=QLabel(name); lb.setMinimumWidth(190); row.addWidget(lb)
+            for c in cols:
+                b=QPushButton(); b.setFixedSize(34,34); b.setToolTip(c.name())
+                b.setStyleSheet(f"background:{c.name()};border:1px solid #888;")
+                b.clicked.connect(lambda _=False,cc=QColor(c):self._select(cc)); row.addWidget(b)
+            row.addStretch(); lay.addLayout(row)
+        self.lbl=QLabel(); lay.addWidget(self.lbl); self._select(self._sel)
+        br=QHBoxLayout()
+        for text,i in (("線色に適用",0),("塗りに適用",1),("ペン色にする",2)):
+            b=QPushButton(text); b.clicked.connect(lambda _=False,k=i:self._cbs[k](QColor(self._sel))); br.addWidget(b)
+        cb=QPushButton("閉じる"); cb.clicked.connect(self.accept); br.addWidget(cb)
+        lay.addLayout(br)
+    def _select(self,c):
+        self._sel=QColor(c); self.lbl.setText(f"選択中: {c.name()}")
+        self.lbl.setStyleSheet(f"border-left:14px solid {c.name()};padding-left:6px;")
+
+class PanelGridDialog(QDialog):
+    def __init__(self,parent):
+        super().__init__(parent); self.setWindowTitle("コマ自動分割")
+        lay=QGridLayout(self)
+        self.rows=QSpinBox(); self.rows.setRange(1,12); self.rows.setValue(3)
+        self.cols=QSpinBox(); self.cols.setRange(1,8); self.cols.setValue(2)
+        self.margin=QDoubleSpinBox(); self.margin.setRange(0,400); self.margin.setValue(40)
+        self.gutter=QDoubleSpinBox(); self.gutter.setRange(0,200); self.gutter.setValue(16)
+        self.bw=QDoubleSpinBox(); self.bw.setRange(0.5,20); self.bw.setValue(3)
+        for i,(t,w) in enumerate((("段数",self.rows),("列数",self.cols),("外余白",self.margin),("コマ間隔",self.gutter),("枠線幅",self.bw))):
+            lay.addWidget(QLabel(t),i,0); lay.addWidget(w,i,1)
+        bb=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject); lay.addWidget(bb,5,0,1,2)
+    def values(self): return (self.rows.value(),self.cols.value(),self.margin.value(),self.gutter.value(),self.bw.value())
 
 # ══════════════════════════════════════════════════════════════
 #  Undo コマンド
@@ -582,6 +934,9 @@ def _vpath_to_el(parent,vp:VPath):
         attrs["data-grad-start"]=vp.gradient_start.name()
         attrs["data-grad-end"]=vp.gradient_end.name()
         attrs["data-grad-angle"]=str(vp.gradient_angle)
+    if vp.mesh_enabled and len(vp.mesh_colors)==vp.mesh_cols*vp.mesh_rows:
+        attrs["data-mesh"]=json.dumps({"c":vp.mesh_cols,"r":vp.mesh_rows,"colors":[c.name(QColor.HexArgb) for c in vp.mesh_colors]})
+        attrs["fill"]=_col(mesh_average(vp.mesh_colors))   # SVG互換用のフォールバック(平均色)
     if vp.meta: attrs["data-meta"]=json.dumps(vp.meta)
     if not vp.visible: attrs["display"]="none"
     path_el=ET.SubElement(parent,"path",attrs)
@@ -791,6 +1146,13 @@ def _d_to_vpath(d: str, attrs: dict) -> Optional[VPath]:
         vp.gradient_end=QColor(attrs.get("data-grad-end","#A78BFA"))
         try: vp.gradient_angle=float(attrs.get("data-grad-angle","0"))
         except: pass
+    try:
+        mj=attrs.get("data-mesh","")
+        if mj:
+            d=json.loads(mj); cc=int(d["c"]); rr=int(d["r"]); cols_=[QColor(x) for x in d["colors"]]
+            if cc>=2 and rr>=2 and len(cols_)==cc*rr:
+                vp.mesh_cols=cc; vp.mesh_rows=rr; vp.mesh_colors=cols_; vp.mesh_enabled=True
+    except Exception: pass
     try:
         m=attrs.get("data-meta","")
         if m: vp.meta=json.loads(m)
@@ -1232,7 +1594,9 @@ def _render_path(painter: QPainter, vp: VPath, brush_defs: Dict):
         painter.drawLine(vp.nodes[0].pos,vp.nodes[1].pos)
         painter.setOpacity(1.0); return
     qpath=vp.to_qpath()
-    if vp.fill_color.alpha()>0:
+    if vp.mesh_enabled and len(vp.mesh_colors)==vp.mesh_cols*vp.mesh_rows and vp.mesh_cols>=2 and vp.mesh_rows>=2:
+        _draw_mesh_fill(painter,vp,qpath)
+    elif vp.fill_color.alpha()>0:
         painter.fillPath(qpath,QBrush(vp.fill_color))
     apply_brush_stroke(painter,vp,brush_defs)
     draw_tone(painter,vp)
@@ -1264,7 +1628,7 @@ class Canvas(QWidget):
         self.doc=doc; self.undo=undo
         self.setMouseTracking(True); self.setFocusPolicy(Qt.StrongFocus)
         # ビュー
-        self._scale=1.0; self._offset=QPointF(40,40)
+        self._scale=1.0; self._offset=QPointF(40,40); self._rot=0.0
         self._pan_start=None; self._pan_off=None
         # ツール
         self.tool=TOOL_PEN
@@ -1302,11 +1666,17 @@ class Canvas(QWidget):
         self._pinch_dist0: Optional[float]=None  # ピンチ開始距離
         self._pinch_scale0: float=1.0            # ピンチ開始時のスケール
         self._swipe_start_pts: Dict[int,QPointF]={} # スワイプ開始位置
+        self._tg_t0=0.0; self._tg_max=0; self._tg_moved=0.0
+        self._tg_start: Dict[int,QPointF]={}; self._tg_base=None
         self.setAttribute(Qt.WA_AcceptTouchEvents, True)
         self.setMinimumSize(400,300)
 
-    def to_doc(self,p): return QPointF((p.x()-self._offset.x())/self._scale,(p.y()-self._offset.y())/self._scale)
-    def to_scr(self,p): return QPointF(p.x()*self._scale+self._offset.x(),p.y()*self._scale+self._offset.y())
+    def _xf(self):
+        t=QTransform(); t.translate(self._offset.x(),self._offset.y()); t.rotate(self._rot); t.scale(self._scale,self._scale); return t
+    def to_doc(self,p):
+        inv,ok=self._xf().inverted()
+        return inv.map(QPointF(p)) if ok else QPointF(p)
+    def to_scr(self,p): return self._xf().map(QPointF(p))
 
     def set_tool(self,t):
         self.tool=t
@@ -1314,7 +1684,7 @@ class Canvas(QWidget):
              TOOL_HAND:Qt.OpenHandCursor,TOOL_ERASER:Qt.CrossCursor,
              TOOL_ADD_NODE:Qt.CrossCursor,TOOL_DEL_NODE:Qt.CrossCursor,
              TOOL_WIDTH:Qt.SizeHorCursor,TOOL_BUCKET:Qt.CrossCursor,
-             TOOL_SCISSORS:Qt.CrossCursor,TOOL_BALLOON:Qt.CrossCursor,
+             TOOL_SCISSORS:Qt.CrossCursor,TOOL_TRIM:Qt.CrossCursor,TOOL_BALLOON:Qt.CrossCursor,
              TOOL_PANEL:Qt.CrossCursor,TOOL_FOCUS_LINE:Qt.CrossCursor,
              TOOL_SPEED_LINE:Qt.CrossCursor}.get(t,Qt.ArrowCursor)
         self.setCursor(cur)
@@ -1328,7 +1698,7 @@ class Canvas(QWidget):
         p=QPainter(self); p.setRenderHint(QPainter.Antialiasing)
         p.fillRect(self.rect(),QColor(C["bg"]))
         self._draw_grid(p)
-        p.save(); p.translate(self._offset); p.scale(self._scale,self._scale)
+        p.save(); p.translate(self._offset); p.rotate(self._rot); p.scale(self._scale,self._scale)
         # キャンバス
         p.fillRect(QRectF(4,4,self.doc.width+4,self.doc.height+4),QColor(0,0,0,60))
         p.fillRect(QRectF(0,0,self.doc.width,self.doc.height),QColor(C["canvas_bg"]))
@@ -1378,7 +1748,7 @@ class Canvas(QWidget):
 
     def _draw_grid(self,p):
         step=40*self._scale
-        if step<8: return
+        if step<8 or abs(self._rot)>0.01: return
         p.setPen(QPen(QColor(C["canvas_grid"]),0.5))
         w,h=self.width(),self.height()
         ox=self._offset.x()%step; oy=self._offset.y()%step
@@ -1525,7 +1895,7 @@ class Canvas(QWidget):
     def _draw_reshape_overlay(self,p):
         if not self.selected: return
         vp=self.selected[0]; p.save()
-        p.translate(self._offset); p.scale(self._scale,self._scale)
+        p.translate(self._offset); p.rotate(self._rot); p.scale(self._scale,self._scale)
         nr=5/self._scale; cr=4/self._scale
         for node in vp.nodes:
             is_sel=node is self.sel_node
@@ -1613,62 +1983,46 @@ class Canvas(QWidget):
         return super().event(ev)
 
     def _handle_touch(self, ev):
-        """2本指ジェスチャー: ピンチズーム / 2本指スワイプでUndo/Redo"""
+        """2本指タップ=Undo / 3本指タップ=Redo / 2本指ドラッグ=ピンチズーム+回転+パン"""
+        import time
         from PySide6.QtCore import QEvent
-        points=ev.points()
+        from PySide6.QtGui import QEventPoint
         etype=ev.type()
-
-        if etype==QEvent.TouchBegin:
-            self._touch_pts={}; self._swipe_start_pts={}
-            self._pinch_dist0=None
-            for pt in points:
-                self._touch_pts[pt.id()]=pt.position()
-                self._swipe_start_pts[pt.id()]=pt.position()
-            if len(points)==2:
-                p1,p2=points[0].position(),points[1].position()
-                self._pinch_dist0=QLineF(p1,p2).length()
-                self._pinch_scale0=self._scale
-            ev.accept(); return
-
-        if etype==QEvent.TouchUpdate:
-            for pt in points:
-                self._touch_pts[pt.id()]=pt.position()
-            if len(points)==2 and self._pinch_dist0 and self._pinch_dist0>1:
-                p1,p2=points[0].position(),points[1].position()
-                dist=QLineF(p1,p2).length()
-                factor=dist/self._pinch_dist0
-                # ピンチ中心を軸にズーム
-                pivot=QPointF((p1.x()+p2.x())/2,(p1.y()+p2.y())/2)
-                new_scale=max(0.02,min(self._pinch_scale0*factor,64.0))
-                ratio=new_scale/self._scale
-                self._offset=QPointF(
-                    pivot.x()-(pivot.x()-self._offset.x())*ratio,
-                    pivot.y()-(pivot.y()-self._offset.y())*ratio,
-                )
-                self._scale=new_scale; self.update()
-            ev.accept(); return
-
-        if etype in (QEvent.TouchEnd, QEvent.TouchCancel):
-            if len(self._swipe_start_pts)==2 and self._pinch_dist0:
-                # ピンチをほぼしていない場合はスワイプ判定
-                p1,p2=points[0].position(),points[1].position()
-                end_dist=QLineF(p1,p2).length()
-                zoom_ratio=end_dist/max(self._pinch_dist0,1)
-                if 0.85<zoom_ratio<1.15:
-                    # ズームしていない → スワイプ方向でUndo/Redo
-                    ids=list(self._swipe_start_pts.keys())
-                    if len(ids)>=2:
-                        start_avg_x=sum(self._swipe_start_pts[i].x() for i in ids[:2])/2
-                        end_avg_x=sum(self._touch_pts.get(i,self._swipe_start_pts[i]).x() for i in ids[:2])/2
-                        dx=end_avg_x-start_avg_x
-                        if abs(dx)>40:   # 40px以上の水平スワイプ
-                            if dx<0:     # 左スワイプ → Undo
-                                if self.undo.canUndo(): self.undo.undo()
-                            else:        # 右スワイプ → Redo
-                                if self.undo.canRedo(): self.undo.redo()
-                            self.update()
-            self._touch_pts={}; self._swipe_start_pts={}; self._pinch_dist0=None
-            ev.accept(); return
+        allpts=list(ev.points())
+        active=[p for p in allpts if p.state()!=QEventPoint.State.Released]
+        if etype==QEvent.TouchBegin or self._tg_t0==0.0:
+            self._tg_t0=time.monotonic(); self._tg_max=0; self._tg_moved=0.0
+            self._tg_start={}; self._tg_base=None
+        for p in allpts:
+            self._tg_start.setdefault(p.id(),QPointF(p.position()))
+            self._tg_moved=max(self._tg_moved,QLineF(self._tg_start[p.id()],p.position()).length())
+        self._tg_max=max(self._tg_max,len(active))
+        if etype in (QEvent.TouchBegin,QEvent.TouchUpdate) and len(active)==2:
+            p1=active[0].position(); p2=active[1].position()
+            c=QPointF((p1.x()+p2.x())/2,(p1.y()+p2.y())/2)
+            d=QLineF(p1,p2).length(); ang=math.degrees(math.atan2(p2.y()-p1.y(),p2.x()-p1.x()))
+            ids=(active[0].id(),active[1].id()); base=self._tg_base
+            if base is None or base["ids"]!=ids:
+                self._tg_base={"ids":ids,"d":max(d,1.0),"a":ang,"scale":self._scale,"rot":self._rot,
+                               "q":self.to_doc(c),"rot_on":False}
+            elif self._tg_moved>12:          # タップではなくジェスチャーと判定
+                da=((ang-base["a"]+180)%360)-180
+                if abs(da)>8: base["rot_on"]=True
+                rot=base["rot"]+(da if base["rot_on"] else 0.0)
+                scale=max(0.02,min(base["scale"]*d/base["d"],64.0))
+                rad=math.radians(rot); q=base["q"]
+                mx=scale*(math.cos(rad)*q.x()-math.sin(rad)*q.y())
+                my=scale*(math.sin(rad)*q.x()+math.cos(rad)*q.y())
+                self._rot=rot; self._scale=scale
+                self._offset=QPointF(c.x()-mx,c.y()-my); self.update()
+        elif len(active)!=2:
+            self._tg_base=None
+        if etype in (QEvent.TouchEnd,QEvent.TouchCancel):
+            tap=(etype==QEvent.TouchEnd and (time.monotonic()-self._tg_t0)<0.35 and self._tg_moved<12)
+            if tap and self._tg_max==2 and self.undo.canUndo(): self.undo.undo(); self.update()
+            elif tap and self._tg_max==3 and self.undo.canRedo(): self.undo.redo(); self.update()
+            self._tg_t0=0.0; self._tg_start={}; self._tg_base=None; self._tg_max=0; self._tg_moved=0.0
+        ev.accept()
 
     def tabletEvent(self,ev):
         """スタイラス筆圧・傾き対応。筆圧を _tablet_pressure に記録しマウスイベントへ転送"""
@@ -1692,6 +2046,7 @@ class Canvas(QWidget):
             elif self.tool==TOOL_WIDTH:      self._width_press(dp)
             elif self.tool==TOOL_BUCKET:     self._bucket_press(dp)
             elif self.tool==TOOL_SCISSORS:   self._scissors_press(dp)   # Fix1: 追加
+            elif self.tool==TOOL_TRIM:       self._trim_press(dp)
             elif self.tool==TOOL_BALLOON:    self._balloon_press(dp)
             elif self.tool==TOOL_PANEL:      self._panel_press(dp)
             elif self.tool==TOOL_FOCUS_LINE: self._focus_press(dp)
@@ -1733,6 +2088,7 @@ class Canvas(QWidget):
             elif self.tool==TOOL_WIDTH:     self._width_press(dp)
             elif self.tool==TOOL_BUCKET:    self._bucket_press(dp)
             elif self.tool==TOOL_SCISSORS:  self._scissors_press(dp)
+            elif self.tool==TOOL_TRIM:      self._trim_press(dp)
             elif self.tool==TOOL_BALLOON:   self._balloon_press(dp)
             elif self.tool==TOOL_PANEL:     self._panel_press(dp)
             elif self.tool==TOOL_FOCUS_LINE:self._focus_press(dp)
@@ -2155,6 +2511,25 @@ class Canvas(QWidget):
         self.document_changed.emit(); self.update()
 
     # ─── 交差点切断 ───
+    def _trim_press(self,dp):
+        """交差点消しゴム: クリックした線のうち、隣り合う交差点までの区間(はみ出し)を削除"""
+        hit=self._hit_paths(dp)
+        if not hit: return
+        layer,_=self.doc.find_path(hit.id)
+        if not layer or layer.locked: return
+        others=[p for l in self.doc.layers if l.visible for p in l.paths if p is not hit and p.visible]
+        pieces=trim_at_intersections(hit,others,dp)
+        win=self.window()
+        if pieces is None:
+            if hasattr(win,"statusBar"): win.statusBar().showMessage("この線には交差する線がありません",3000)
+            return
+        self.undo.beginMacro("交差点消しゴム")
+        self.undo.push(CmdDeletePaths([(layer,hit)]))
+        for pc in pieces: self.undo.push(CmdAddPath(layer,pc))
+        self.undo.endMacro()
+        if hit in self.selected: self.selected.remove(hit)
+        self.selection_changed.emit(self.selected); self.document_changed.emit(); self.update()
+
     def _scissors_press(self,dp):
         r=10/self._scale
         for layer in self.doc.layers:
@@ -2372,13 +2747,19 @@ class Canvas(QWidget):
         if prev_n!=self._hover_node or prev_p!=self._hover_path: self.update()
 
     def fit_canvas(self):
+        self._rot=0.0
         wr=(self.width()-80)/self.doc.width; hr=(self.height()-80)/self.doc.height
         self._scale=min(wr,hr)
         self._offset=QPointF((self.width()-self.doc.width*self._scale)/2,
                              (self.height()-self.doc.height*self._scale)/2)
         self.update()
 
+    def reset_rotation(self):
+        c=QPointF(self.width()/2,self.height()/2); q=self.to_doc(c); self._rot=0.0
+        self._offset=QPointF(c.x()-self._scale*q.x(),c.y()-self._scale*q.y()); self.update()
+
     def zoom_to(self,s):
+        self._rot=0.0
         c=QPointF(self.width()/2,self.height()/2)
         self._offset=QPointF(c.x()-self.doc.width/2*s,c.y()-self.doc.height/2*s)
         self._scale=s; self.update()
@@ -2934,7 +3315,18 @@ class PropsPanel(QWidget):
         self.spin_grad_angle.valueChanged.connect(self._on_grad_angle); ar.addWidget(self.spin_grad_angle)
         for w in[self.chk_grad,self.btn_gstart,self.btn_gend]: ggl.addWidget(w)
         ggl.addLayout(ar)
-        t3l.addWidget(gg); t3l.addStretch()
+        t3l.addWidget(gg)
+        mg=QGroupBox("メッシュグラデーション"); mgl=QVBoxLayout(mg)
+        self.chk_mesh=QCheckBox("メッシュ有効 (塗り領域をカラーグリッドで描画)")
+        self.chk_mesh.toggled.connect(self._on_mesh_toggle)
+        sr=QHBoxLayout(); sr.addWidget(QLabel("列"))
+        self.spin_mesh_c=QSpinBox(); self.spin_mesh_c.setRange(2,6); self.spin_mesh_c.setValue(3); sr.addWidget(self.spin_mesh_c)
+        sr.addWidget(QLabel("行"))
+        self.spin_mesh_r=QSpinBox(); self.spin_mesh_r.setRange(2,6); self.spin_mesh_r.setValue(3); sr.addWidget(self.spin_mesh_r)
+        self.spin_mesh_c.valueChanged.connect(self._on_mesh_size); self.spin_mesh_r.valueChanged.connect(self._on_mesh_size)
+        self.btn_mesh_edit=QPushButton("メッシュ色を編集…"); self.btn_mesh_edit.clicked.connect(self._edit_mesh)
+        mgl.addWidget(self.chk_mesh); mgl.addLayout(sr); mgl.addWidget(self.btn_mesh_edit)
+        t3l.addWidget(mg); t3l.addStretch()
         tabs.addTab(t3,"グラデ")
         # ── 情報/変形 ──
         t4=QWidget(); t4l=QVBoxLayout(t4); t4l.setSpacing(6)
@@ -2973,6 +3365,10 @@ class PropsPanel(QWidget):
         self.btn_gstart.setStyleSheet(f"background:{vp.gradient_start.name()};border:1px solid {C['border']};border-radius:4px;")
         self.btn_gend.setStyleSheet(f"background:{vp.gradient_end.name()};border:1px solid {C['border']};border-radius:4px;")
         self.spin_grad_angle.blockSignals(True); self.spin_grad_angle.setValue(vp.gradient_angle); self.spin_grad_angle.blockSignals(False)
+        for w_,v_ in ((self.chk_mesh,vp.mesh_enabled),(self.spin_mesh_c,vp.mesh_cols),(self.spin_mesh_r,vp.mesh_rows)):
+            w_.blockSignals(True)
+            (w_.setChecked if w_ is self.chk_mesh else w_.setValue)(v_)
+            w_.blockSignals(False)
         br=vp.bounding_rect()
         self.lbl_info.setText(f"ノード数: {len(vp.nodes)}\n状態: {'閉じたパス' if vp.closed else '開いたパス'}\nブラシ: {vp.brush_name}\nX:{br.x():.1f}  Y:{br.y():.1f}\nW:{br.width():.1f}  H:{br.height():.1f}")
         for spin,val in[(self._tx_spin,br.x()),(self._ty_spin,br.y()),(self._tw_spin,br.width()),(self._th_spin,br.height())]:
@@ -3057,6 +3453,37 @@ class PropsPanel(QWidget):
     def _on_grad_angle(self,v):
         for vp in self._paths: vp.gradient_angle=v
         self.canvas.update(); self.changed.emit()
+
+    def _mesh_ensure(self,vp):
+        if len(vp.mesh_colors)!=vp.mesh_cols*vp.mesh_rows:
+            vp.mesh_colors=default_mesh_colors(vp.mesh_cols,vp.mesh_rows,vp.gradient_start,vp.gradient_end)
+
+    def _on_mesh_toggle(self,v):
+        for vp in self._paths:
+            vp.mesh_enabled=v
+            if v: self._mesh_ensure(vp)
+        self.canvas.update(); self.changed.emit()
+
+    def _on_mesh_size(self,_=None):
+        c=self.spin_mesh_c.value(); r=self.spin_mesh_r.value()
+        for vp in self._paths:
+            if len(vp.mesh_colors)==vp.mesh_cols*vp.mesh_rows:
+                vp.mesh_colors=mesh_resample(vp.mesh_colors,vp.mesh_cols,vp.mesh_rows,c,r)
+            else:
+                vp.mesh_colors=default_mesh_colors(c,r,vp.gradient_start,vp.gradient_end)
+            vp.mesh_cols=c; vp.mesh_rows=r
+        self.canvas.update(); self.changed.emit()
+
+    def _edit_mesh(self):
+        if not self._paths: return
+        vp=self._paths[0]; self._mesh_ensure(vp)
+        dlg=MeshEditDialog(self,vp.mesh_cols,vp.mesh_rows,vp.mesh_colors)
+        if dlg.exec()==QDialog.Accepted:
+            for p in self._paths:
+                if (p.mesh_cols,p.mesh_rows)==(vp.mesh_cols,vp.mesh_rows):
+                    p.mesh_colors=[QColor(c) for c in dlg.colors]; p.mesh_enabled=True
+            self.chk_mesh.blockSignals(True); self.chk_mesh.setChecked(True); self.chk_mesh.blockSignals(False)
+            self.canvas.update(); self.changed.emit()
 
     def _apply_transform(self):
         if not self._paths: return
@@ -3170,7 +3597,7 @@ class MainWindow(QMainWindow):
         self.doc=Document()
         self.undo=QUndoStack(self); self.undo.setUndoLimit(200)
         self._filepath=None; self._modified=False
-        self._build_ui(); self._build_menu(); self._build_toolbar(); self._build_status()
+        self._build_ui(); self._build_status(); self._build_menu(); self._build_toolbar()
         self.canvas.fit_canvas()
 
     def _build_ui(self):
@@ -3238,6 +3665,7 @@ class MainWindow(QMainWindow):
         va("100%","Ctrl+1",lambda:self.canvas.zoom_to(1.0))
         va("200%","Ctrl+2",lambda:self.canvas.zoom_to(2.0))
         va("50%","Ctrl+5",lambda:self.canvas.zoom_to(0.5))
+        va("回転をリセット","Ctrl+Shift+0",self.canvas.reset_rotation)
         # 漫画
         cm=mb.addMenu("漫画")
         a_wt=cm.addAction("Webtoonモード設定…"); a_wt.triggered.connect(self._webtoon_settings)
@@ -3245,6 +3673,11 @@ class MainWindow(QMainWindow):
         cm.addSeparator()
         a_fl=cm.addAction("集中線ツールへ"); a_fl.triggered.connect(lambda: self._set_tool(TOOL_FOCUS_LINE))
         a_sl=cm.addAction("効果線を生成");   a_sl.triggered.connect(self.tool_opts._gen_speed)
+        # 制作アシスト (生成AIではなく制作支援)
+        am=mb.addMenu("アシスト")
+        for lbl,fn in (("配色提案…",self._assist_color),("アンカー軽量化(パス最適化)…",self._assist_simplify),
+                       ("コマ自動分割…",self._assist_panels),("フキダシ配置補助 (コマを選択)",self._assist_balloon)):
+            a_=am.addAction(lbl); a_.triggered.connect(fn)
 
     def _build_toolbar(self):
         tb=self.addToolBar("ツール"); tb.setMovable(False)
@@ -3259,7 +3692,8 @@ class MainWindow(QMainWindow):
             ("−","Shift+D",TOOL_DEL_NODE,"アンカー削除"),
             ("↔","W",TOOL_WIDTH,"線幅編集"),
             ("🪣","B",TOOL_BUCKET,"バケツ塗り"),
-            ("✂","C",TOOL_SCISSORS,"交差点切断"),
+            ("✂","C",TOOL_SCISSORS,"パス切断"),
+            ("✄","T",TOOL_TRIM,"交差点消しゴム"),
             ("💬","F2",TOOL_BALLOON,"フキダシ"),
             ("⬜","F3",TOOL_PANEL,"コマ割り"),
             ("⭐","F4",TOOL_FOCUS_LINE,"集中線"),
@@ -3306,7 +3740,7 @@ class MainWindow(QMainWindow):
             TOOL_PEN:"ペン (P)",TOOL_RESHAPE:"Reshape (A)",TOOL_SELECT:"選択 (V)",
             TOOL_HAND:"手のひら (H)",TOOL_ERASER:"消しゴム (E)",
             TOOL_ADD_NODE:"アンカー追加",TOOL_DEL_NODE:"アンカー削除",
-            TOOL_WIDTH:"線幅編集 (W)",TOOL_BUCKET:"バケツ (B)",TOOL_SCISSORS:"切断 (C)",
+            TOOL_WIDTH:"線幅編集 (W)",TOOL_BUCKET:"バケツ (B)",TOOL_SCISSORS:"パス切断 (C)",TOOL_TRIM:"交差点消しゴム (T)",
             TOOL_BALLOON:"フキダシ (F2)",TOOL_PANEL:"コマ割り (F3)",
             TOOL_FOCUS_LINE:"集中線 (F4)",TOOL_SPEED_LINE:"効果線 (F5)",
         }
@@ -3329,6 +3763,65 @@ class MainWindow(QMainWindow):
         self._modified=True
         f=self._filepath.split("/")[-1] if self._filepath else "無題"
         self.setWindowTitle(f"VektorStudio v2* — {f}")
+
+    # ─── 制作アシスト ───
+    def _status(self,msg): self.statusBar().showMessage(msg,4000)
+
+    def _assist_color(self):
+        cv=self.canvas; sel=cv.selected
+        if sel: base=sel[0].fill_color if sel[0].fill_color.alpha()>0 else sel[0].stroke_color
+        else: base=cv.pen_color
+        def ap_stroke(c):
+            for vp in cv.selected: vp.stroke_color=QColor(c)
+            cv.update(); cv.document_changed.emit()
+        def ap_fill(c):
+            if not cv.selected: self._status("塗りを適用するパスを選択してください"); return
+            cv.undo.beginMacro("配色適用")
+            for vp in cv.selected: cv.undo.push(CmdSetFillColor(vp,vp.fill_color,QColor(c)))
+            cv.undo.endMacro(); cv.update(); cv.document_changed.emit()
+        def ap_pen(c):
+            cv.pen_color=QColor(c)
+            self.lbl_pc.setStyleSheet(f"background:{QColor(c).name()};border:2px solid {C['border']};border-radius:4px;")
+        ColorSuggestDialog(self,QColor(base),ap_stroke,ap_fill,ap_pen).exec()
+
+    def _assist_simplify(self):
+        cv=self.canvas; sel=list(cv.selected)
+        if not sel: self._status("パスを選択してください"); return
+        tol,ok=QInputDialog.getDouble(self,"アンカー軽量化","許容誤差 (px)",1.0,0.1,50.0,1)
+        if not ok: return
+        cv.undo.beginMacro("アンカー軽量化"); total=0
+        for vp in sel:
+            nodes,pres,removed=simplify_vpath(vp,tol)
+            if removed>0:
+                cv.undo.push(CmdReplaceNodes(vp,vp.nodes,vp.pressure,nodes,pres,"アンカー軽量化")); total+=removed
+        cv.undo.endMacro()
+        cv.selection_changed.emit(cv.selected); cv.document_changed.emit(); cv.update()
+        self._status(f"{total}個のアンカーを削除しました")
+
+    def _assist_panels(self):
+        dlg=PanelGridDialog(self)
+        if dlg.exec()!=QDialog.Accepted: return
+        rows,cols,margin,gutter,bw=dlg.values()
+        doc=self.canvas.doc; W,H=doc.width,doc.height
+        cw=(W-2*margin-(cols-1)*gutter)/cols; ch=(H-2*margin-(rows-1)*gutter)/rows
+        if cw<10 or ch<10: self._status("余白/間隔が大きすぎてコマを作れません"); return
+        layer=doc.active_layer; und=self.canvas.undo
+        und.beginMacro("コマ自動分割")
+        for r in range(rows):
+            for c in range(cols):
+                rect=QRectF(margin+c*(cw+gutter),margin+r*(ch+gutter),cw,ch)
+                und.push(CmdAddPath(layer,make_panel(rect,bw)))
+        und.endMacro(); self.canvas.document_changed.emit(); self.canvas.update()
+
+    def _assist_balloon(self):
+        cv=self.canvas
+        sel=[p for p in cv.selected if p.meta.get("type")=="panel"]
+        if not sel: self._status("コマ(枠)を選択してから実行してください"); return
+        rect=suggest_balloon_rect(cv.doc,sel[0])
+        vp=make_balloon(rect.center(),rect.width()/2,rect.height()/2,BALLOON_ELLIPSE)
+        cv.undo.push(CmdAddPath(cv.doc.active_layer,vp))
+        cv.selected=[vp]; cv.selection_changed.emit(cv.selected); cv.document_changed.emit(); cv.update()
+        cv._open_balloon_text_dialog(vp)
 
     def _new_doc(self):
         if self._modified:
