@@ -57,7 +57,7 @@ from PySide6.QtGui import (
     QPainter, QPainterPath, QPen, QBrush, QColor, QAction,
     QUndoStack, QUndoCommand, QTransform, QPainterPathStroker,
     QLinearGradient, QRadialGradient, QFont, QCursor, QKeySequence,
-    QPixmap, QImage, QConicalGradient, QGradient,
+    QPixmap, QImage, QConicalGradient, QGradient, QPolygonF,
 )
 from PySide6.QtCore import (
     Qt, QPointF, QRectF, QSizeF, QTimer, Signal, QLineF, QSize, QMarginsF,
@@ -168,6 +168,7 @@ TOOL_WIDTH      = "width"
 TOOL_BUCKET     = "bucket"
 TOOL_SCISSORS   = "scissors"
 TOOL_TRIM       = "trim"       # 交差点消しゴム
+TOOL_MESH       = "mesh"       # メッシュ編集
 TOOL_BALLOON    = "balloon"   # フキダシ
 TOOL_PANEL      = "panel"     # コマ割り
 TOOL_FOCUS_LINE = "focus"     # 集中線
@@ -306,6 +307,7 @@ class VPath:
         # カラーメッシュ (行×列のカラーグリッドを滑らかに補間)
         self.mesh_enabled=False; self.mesh_cols=3; self.mesh_rows=3
         self.mesh_colors:List[QColor]=[]
+        self.mesh_pts:List[Tuple[float,float]]=[]   # 各格子点の位置 (パスのBBox基準 0..1。範囲外も可)
         # トーン
         self.tone_type=TONE_NONE; self.tone_freq=20.0; self.tone_size=3.0
         # テキスト (フキダシ内テキスト)
@@ -330,7 +332,7 @@ class VPath:
     def hit_test(self,pt,r=8.0):
         qp=self.to_qpath(); st=QPainterPathStroker(); st.setWidth(max(self.stroke_width,r*2))
         if st.createStroke(qp).contains(pt): return True
-        if self.fill_color.alpha()>0: return qp.contains(pt)
+        if self.fill_color.alpha()>0 or self.mesh_enabled: return qp.contains(pt)   # メッシュ塗りも内側クリックで選択可
         return False
 
     def node_at(self,pt,r=8.0):
@@ -377,7 +379,7 @@ class VPath:
         vp.gradient_start=QColor(self.gradient_start); vp.gradient_end=QColor(self.gradient_end)
         vp.gradient_angle=self.gradient_angle
         vp.mesh_enabled=self.mesh_enabled; vp.mesh_cols=self.mesh_cols; vp.mesh_rows=self.mesh_rows
-        vp.mesh_colors=[QColor(c) for c in self.mesh_colors]
+        vp.mesh_colors=[QColor(c) for c in self.mesh_colors]; vp.mesh_pts=list(self.mesh_pts)
         vp.tone_type=self.tone_type; vp.tone_freq=self.tone_freq; vp.tone_size=self.tone_size
         vp.text=self.text; vp.text_size=self.text_size
         vp.text_color=QColor(self.text_color); vp.text_align=self.text_align
@@ -671,24 +673,89 @@ def mesh_average(colors):
     n=max(len(colors),1)
     return QColor(sum(c.red() for c in colors)//n,sum(c.green() for c in colors)//n,sum(c.blue() for c in colors)//n)
 
-def _mesh_image(vp,res=48):
-    key=(vp.mesh_cols,vp.mesh_rows,tuple(c.rgba() for c in vp.mesh_colors))
-    cache=getattr(vp,"_mesh_cache",None)
-    if cache and cache[0]==key: return cache[1]
-    img=QImage(res,res,QImage.Format_ARGB32)
-    for y in range(res):
-        for x in range(res):
-            r,g,b,a=_mesh_sample(vp.mesh_colors,vp.mesh_cols,vp.mesh_rows,x/(res-1),y/(res-1))
-            img.setPixelColor(x,y,QColor(r,g,b,a))
-    vp._mesh_cache=(key,img)
-    return img
+def default_mesh_pts(cols,rows):
+    return [(c/max(cols-1,1),r/max(rows-1,1)) for r in range(rows) for c in range(cols)]
 
-def _draw_mesh_fill(painter,vp,qpath):
-    img=_mesh_image(vp)
+def mesh_resample_pts(pts,c0,r0,c1,r1):
+    """格子点の位置を双線形補間で別サイズへ再サンプル (編集した形を保つ)"""
+    out=[]
+    for r in range(r1):
+        for c in range(c1):
+            gx=c/max(c1-1,1)*(c0-1); gy=r/max(r1-1,1)*(r0-1)
+            i=min(int(gx),c0-2); j=min(int(gy),r0-2); fx=gx-i; fy=gy-j
+            p00=pts[j*c0+i]; p10=pts[j*c0+i+1]; p01=pts[(j+1)*c0+i]; p11=pts[(j+1)*c0+i+1]
+            out.append(tuple((p00[k]*(1-fx)+p10[k]*fx)*(1-fy)+(p01[k]*(1-fx)+p11[k]*fx)*fy for k in (0,1)))
+    return out
+
+def _mesh_pts_of(vp):
+    return vp.mesh_pts if len(vp.mesh_pts)==vp.mesh_cols*vp.mesh_rows else default_mesh_pts(vp.mesh_cols,vp.mesh_rows)
+
+def mesh_rect(vp): return vp.to_qpath().boundingRect()
+
+def mesh_point_doc(vp,i,rect=None):
+    r=rect or mesh_rect(vp); u,v=_mesh_pts_of(vp)[i]
+    return QPointF(r.x()+u*r.width(),r.y()+v*r.height())
+
+def mesh_cells_convex(pts,cols,rows,R,cells=None):
+    """各セルの四角形が凸か (凹/折り返しだと双線形パッチが破綻するため)"""
+    def P(i): u,v=pts[i]; return (R.x()+u*R.width(),R.y()+v*R.height())
+    for j in range(rows-1):
+        for i in range(cols-1):
+            if cells is not None and (i,j) not in cells: continue
+            q=[P(j*cols+i),P(j*cols+i+1),P((j+1)*cols+i+1),P((j+1)*cols+i)]
+            sg=[]
+            for k in range(4):
+                a=q[k]; b=q[(k+1)%4]; c=q[(k+2)%4]
+                sg.append((b[0]-a[0])*(c[1]-b[1])-(b[1]-a[1])*(c[0]-b[0]))
+            if not (all(x>1e-6 for x in sg) or all(x<-1e-6 for x in sg)): return False
+    return True
+
+def mesh_state(vp):
+    return (vp.mesh_enabled,vp.mesh_cols,vp.mesh_rows,[QColor(c) for c in vp.mesh_colors],list(_mesh_pts_of(vp)))
+
+def mesh_apply(vp,st):
+    vp.mesh_enabled,vp.mesh_cols,vp.mesh_rows=st[0],st[1],st[2]
+    vp.mesh_colors=[QColor(c) for c in st[3]]; vp.mesh_pts=list(st[4])
+
+class CmdMeshState(QUndoCommand):
+    def __init__(self,vp,old,new,text="メッシュ編集"):
+        super().__init__(text); self.vp=vp; self.o=old; self.n=new
+    def redo(self): mesh_apply(self.vp,self.n)
+    def undo(self): mesh_apply(self.vp,self.o)
+
+def _draw_mesh_fill(painter,vp,qpath,sub=6):
+    """格子点(位置+色)を持つ本格メッシュ。各セルを双線形パッチとして sub×sub に分割して描画"""
+    cols,rows=vp.mesh_cols,vp.mesh_rows
+    R=qpath.boundingRect()
+    if R.width()<=0 or R.height()<=0 or cols<2 or rows<2: return
+    pts=_mesh_pts_of(vp); cs=vp.mesh_colors
+    def P(i):
+        u,v=pts[i]; return (R.x()+u*R.width(),R.y()+v*R.height())
     painter.save()
     painter.setClipPath(qpath)
-    painter.setRenderHint(QPainter.SmoothPixmapTransform,True)
-    painter.drawImage(qpath.boundingRect(),img)
+    if all(c.alpha()==255 for c in cs): painter.fillPath(qpath,QBrush(mesh_average(cs)))   # 下地(はみ出し部)
+    painter.setRenderHint(QPainter.Antialiasing,False)
+    for j in range(rows-1):
+        for i in range(cols-1):
+            q00=P(j*cols+i); q10=P(j*cols+i+1); q01=P((j+1)*cols+i); q11=P((j+1)*cols+i+1)
+            c00=cs[j*cols+i]; c10=cs[j*cols+i+1]; c01=cs[(j+1)*cols+i]; c11=cs[(j+1)*cols+i+1]
+            def pos(s_,t_):
+                x=(q00[0]*(1-s_)+q10[0]*s_)*(1-t_)+(q01[0]*(1-s_)+q11[0]*s_)*t_
+                y=(q00[1]*(1-s_)+q10[1]*s_)*(1-t_)+(q01[1]*(1-s_)+q11[1]*s_)*t_
+                return QPointF(x,y)
+            def col(s_,t_):
+                s_=s_*s_*(3-2*s_); t_=t_*t_*(3-2*t_)
+                def ch(f):
+                    top=f(c00)*(1-s_)+f(c10)*s_; bot=f(c01)*(1-s_)+f(c11)*s_
+                    return int(round(top*(1-t_)+bot*t_))
+                return QColor(ch(lambda c:c.red()),ch(lambda c:c.green()),ch(lambda c:c.blue()),ch(lambda c:c.alpha()))
+            for b_ in range(sub):
+                for a_ in range(sub):
+                    s0=a_/sub; s1=(a_+1)/sub; t0=b_/sub; t1=(b_+1)/sub
+                    poly=QPolygonF([pos(s0,t0),pos(s1,t0),pos(s1,t1),pos(s0,t1)])
+                    c=col((s0+s1)/2,(t0+t1)/2)
+                    painter.setBrush(QBrush(c)); painter.setPen(QPen(c,0.6))   # 継ぎ目対策
+                    painter.drawPolygon(poly)
     painter.restore()
 
 # ══════════════════════════════════════════════════════════════
@@ -935,7 +1002,7 @@ def _vpath_to_el(parent,vp:VPath):
         attrs["data-grad-end"]=vp.gradient_end.name()
         attrs["data-grad-angle"]=str(vp.gradient_angle)
     if vp.mesh_enabled and len(vp.mesh_colors)==vp.mesh_cols*vp.mesh_rows:
-        attrs["data-mesh"]=json.dumps({"c":vp.mesh_cols,"r":vp.mesh_rows,"colors":[c.name(QColor.HexArgb) for c in vp.mesh_colors]})
+        attrs["data-mesh"]=json.dumps({"c":vp.mesh_cols,"r":vp.mesh_rows,"colors":[c.name(QColor.HexArgb) for c in vp.mesh_colors],"pts":[[round(u_,5),round(v_,5)] for u_,v_ in _mesh_pts_of(vp)]})
         attrs["fill"]=_col(mesh_average(vp.mesh_colors))   # SVG互換用のフォールバック(平均色)
     if vp.meta: attrs["data-meta"]=json.dumps(vp.meta)
     if not vp.visible: attrs["display"]="none"
@@ -1152,6 +1219,8 @@ def _d_to_vpath(d: str, attrs: dict) -> Optional[VPath]:
             d=json.loads(mj); cc=int(d["c"]); rr=int(d["r"]); cols_=[QColor(x) for x in d["colors"]]
             if cc>=2 and rr>=2 and len(cols_)==cc*rr:
                 vp.mesh_cols=cc; vp.mesh_rows=rr; vp.mesh_colors=cols_; vp.mesh_enabled=True
+                pp_=d.get("pts")
+                vp.mesh_pts=[(float(a_),float(b_)) for a_,b_ in pp_] if pp_ and len(pp_)==cc*rr else default_mesh_pts(cc,rr)
     except Exception: pass
     try:
         m=attrs.get("data-meta","")
@@ -1667,6 +1736,7 @@ class Canvas(QWidget):
         self._pinch_scale0: float=1.0            # ピンチ開始時のスケール
         self._swipe_start_pts: Dict[int,QPointF]={} # スワイプ開始位置
         self._tg_t0=0.0; self._tg_max=0; self._tg_moved=0.0
+        self._mesh_drag_i=None; self._mesh_old=None; self._mesh_rect=None; self._mesh_press_dp=None; self._mesh_moved=False
         self._tg_start: Dict[int,QPointF]={}; self._tg_base=None
         self.setAttribute(Qt.WA_AcceptTouchEvents, True)
         self.setMinimumSize(400,300)
@@ -1684,11 +1754,11 @@ class Canvas(QWidget):
              TOOL_HAND:Qt.OpenHandCursor,TOOL_ERASER:Qt.CrossCursor,
              TOOL_ADD_NODE:Qt.CrossCursor,TOOL_DEL_NODE:Qt.CrossCursor,
              TOOL_WIDTH:Qt.SizeHorCursor,TOOL_BUCKET:Qt.CrossCursor,
-             TOOL_SCISSORS:Qt.CrossCursor,TOOL_TRIM:Qt.CrossCursor,TOOL_BALLOON:Qt.CrossCursor,
+             TOOL_SCISSORS:Qt.CrossCursor,TOOL_TRIM:Qt.CrossCursor,TOOL_MESH:Qt.CrossCursor,TOOL_BALLOON:Qt.CrossCursor,
              TOOL_PANEL:Qt.CrossCursor,TOOL_FOCUS_LINE:Qt.CrossCursor,
              TOOL_SPEED_LINE:Qt.CrossCursor}.get(t,Qt.ArrowCursor)
         self.setCursor(cur)
-        if t not in(TOOL_RESHAPE,TOOL_SELECT):
+        if t not in(TOOL_RESHAPE,TOOL_SELECT,TOOL_MESH):
             self.selected=[]; self.sel_node=None; self.selection_changed.emit([])
         self._pen_path=None; self._pen_drawing=False; self._pen_sym_paths=[]; self._raw_pts=[]
         self.update()
@@ -1733,6 +1803,7 @@ class Canvas(QWidget):
         # Reshape overlay
         if self.tool in(TOOL_RESHAPE,TOOL_ADD_NODE,TOOL_DEL_NODE):
             self._draw_reshape_overlay(p)
+        if self.tool==TOOL_MESH: self._draw_mesh_overlay(p)
         # BB
         if self.tool==TOOL_SELECT and self.selected:
             self._draw_bounding_box(p)
@@ -2047,6 +2118,7 @@ class Canvas(QWidget):
             elif self.tool==TOOL_BUCKET:     self._bucket_press(dp)
             elif self.tool==TOOL_SCISSORS:   self._scissors_press(dp)   # Fix1: 追加
             elif self.tool==TOOL_TRIM:       self._trim_press(dp)
+            elif self.tool==TOOL_MESH:       self._mesh_press(dp)
             elif self.tool==TOOL_BALLOON:    self._balloon_press(dp)
             elif self.tool==TOOL_PANEL:      self._panel_press(dp)
             elif self.tool==TOOL_FOCUS_LINE: self._focus_press(dp)
@@ -2056,6 +2128,7 @@ class Canvas(QWidget):
                 dp_snap=get_persp_snap(self.doc,dp,snap_radius=20/self._scale)
                 self._pen_drag(dp_snap)
             elif self.tool==TOOL_RESHAPE:    self._reshape_drag(dp)
+            elif self.tool==TOOL_MESH:       self._mesh_drag(dp)
             elif self.tool==TOOL_SELECT:     self._select_drag(pos,dp)
             elif self.tool==TOOL_WIDTH:      self._width_drag(dp)
             elif self.tool==TOOL_BALLOON:    self._balloon_drag(dp)
@@ -2065,6 +2138,7 @@ class Canvas(QWidget):
         elif etype==QEvent.TabletRelease:
             if   self.tool==TOOL_PEN:        self._pen_release(dp)
             elif self.tool==TOOL_RESHAPE:    self._reshape_release(dp)
+            elif self.tool==TOOL_MESH:       self._mesh_release(dp)
             elif self.tool==TOOL_SELECT:     self._select_release(dp)
             elif self.tool==TOOL_WIDTH:      self._width_release(dp)
             elif self.tool==TOOL_BALLOON:    self._balloon_release(dp)
@@ -2089,6 +2163,7 @@ class Canvas(QWidget):
             elif self.tool==TOOL_BUCKET:    self._bucket_press(dp)
             elif self.tool==TOOL_SCISSORS:  self._scissors_press(dp)
             elif self.tool==TOOL_TRIM:      self._trim_press(dp)
+            elif self.tool==TOOL_MESH:      self._mesh_press(dp)
             elif self.tool==TOOL_BALLOON:   self._balloon_press(dp)
             elif self.tool==TOOL_PANEL:     self._panel_press(dp)
             elif self.tool==TOOL_FOCUS_LINE:self._focus_press(dp)
@@ -2107,6 +2182,7 @@ class Canvas(QWidget):
                 dp_snap=get_persp_snap(self.doc,dp,snap_radius=20/self._scale)
                 self._pen_drag(dp_snap)
             elif self.tool==TOOL_RESHAPE:  self._reshape_drag(dp)
+            elif self.tool==TOOL_MESH:     self._mesh_drag(dp)
             elif self.tool==TOOL_SELECT:   self._select_drag(pos,dp)
             elif self.tool==TOOL_WIDTH:    self._width_drag(dp)
             elif self.tool==TOOL_BALLOON:  self._balloon_drag(dp)
@@ -2125,6 +2201,7 @@ class Canvas(QWidget):
             dp=self.to_doc(ev.position())
             if   self.tool==TOOL_PEN:        self._pen_release(dp)
             elif self.tool==TOOL_RESHAPE:    self._reshape_release(dp)
+            elif self.tool==TOOL_MESH:       self._mesh_release(dp)
             elif self.tool==TOOL_SELECT:     self._select_release(dp)
             elif self.tool==TOOL_WIDTH:      self._width_release(dp)
             elif self.tool==TOOL_BALLOON:    self._balloon_release(dp)
@@ -2511,6 +2588,94 @@ class Canvas(QWidget):
         self.document_changed.emit(); self.update()
 
     # ─── 交差点切断 ───
+    # ─── メッシュ編集ツール (M) ───
+    def _mesh_target(self):
+        vp=self.selected[0] if self.selected else None
+        return vp if (vp is not None and vp.mesh_enabled and vp.mesh_cols>=2 and vp.mesh_rows>=2
+                      and len(vp.mesh_colors)==vp.mesh_cols*vp.mesh_rows) else None
+
+    def _mesh_hit(self,vp,dp):
+        R=mesh_rect(vp); best=None
+        for i in range(vp.mesh_cols*vp.mesh_rows):
+            q=mesh_point_doc(vp,i,R); d=math.hypot(q.x()-dp.x(),q.y()-dp.y())
+            if d<=11/self._scale and (best is None or d<best[0]): best=(d,i)
+        return best[1] if best else None
+
+    def _hit_closed(self,dp):
+        """未塗りでも、閉じたパスの内側クリックで対象にする (メッシュ作成用)"""
+        for layer in reversed(self.doc.layers):
+            if not layer.visible or layer.locked: continue
+            for item in reversed(layer.items):
+                vps=list(reversed(item.items)) if isinstance(item,VGroup) else [item]
+                for vp in vps:
+                    if isinstance(vp,VPath) and vp.closed and vp.visible and vp.to_qpath().contains(dp): return vp
+        return None
+
+    def _mesh_press(self,dp):
+        vp=self._mesh_target()
+        if vp is not None:
+            i=self._mesh_hit(vp,dp)
+            if i is not None:
+                self._mesh_drag_i=i; self._mesh_old=mesh_state(vp); self._mesh_rect=mesh_rect(vp)
+                self._mesh_press_dp=QPointF(dp); self._mesh_moved=False; return
+        hit=self._hit_paths(dp) or self._hit_closed(dp)
+        if not hit: return
+        layer,_=self.doc.find_path(hit.id)
+        if not layer or layer.locked: return
+        if not (hit.mesh_enabled and len(hit.mesh_colors)==hit.mesh_cols*hit.mesh_rows):
+            old=mesh_state(hit)
+            base=hit.fill_color if hit.fill_color.alpha()>0 else hit.gradient_start
+            cols_=default_mesh_colors(hit.mesh_cols,hit.mesh_rows,base,hit.gradient_end)
+            new=(True,hit.mesh_cols,hit.mesh_rows,cols_,default_mesh_pts(hit.mesh_cols,hit.mesh_rows))
+            self.undo.push(CmdMeshState(hit,old,new,"メッシュ作成"))
+        self.selected=[hit]; self.selection_changed.emit(self.selected); self.document_changed.emit(); self.update()
+
+    def _mesh_drag(self,dp):
+        vp=self._mesh_target()
+        if vp is None or self._mesh_drag_i is None: return
+        if not self._mesh_moved:
+            if math.hypot(dp.x()-self._mesh_press_dp.x(),dp.y()-self._mesh_press_dp.y())<3/self._scale: return
+            self._mesh_moved=True
+        R=self._mesh_rect; idx=self._mesh_drag_i; cols,rows=vp.mesh_cols,vp.mesh_rows
+        before=list(_mesh_pts_of(vp)); pts=list(before)
+        pts[idx]=((dp.x()-R.x())/max(R.width(),1e-6),(dp.y()-R.y())/max(R.height(),1e-6))
+        c_,r_=idx%cols,idx//cols
+        adj={(i,j) for i in (c_-1,c_) for j in (r_-1,r_) if 0<=i<cols-1 and 0<=j<rows-1}
+        # 隣接セルが凸だったのに凹になる移動は受け付けない (色が折り返して破綻するため)
+        if mesh_cells_convex(before,cols,rows,R,adj) and not mesh_cells_convex(pts,cols,rows,R,adj): return
+        vp.mesh_pts=pts; self.update()
+
+    def _mesh_release(self,dp):
+        i=self._mesh_drag_i; vp=self._mesh_target()
+        self._mesh_drag_i=None
+        if i is None or vp is None: return
+        if self._mesh_moved:
+            self.undo.push(CmdMeshState(vp,self._mesh_old,mesh_state(vp),"メッシュ点を移動"))
+        else:   # クリックのみ → 色を変更
+            c=QColorDialog.getColor(vp.mesh_colors[i],self,"メッシュ点の色",QColorDialog.ShowAlphaChannel)
+            if c.isValid():
+                new=mesh_state(vp); new[3][i]=QColor(c)
+                self.undo.push(CmdMeshState(vp,self._mesh_old,new,"メッシュ色を変更"))
+        self.document_changed.emit(); self.update()
+
+    def _draw_mesh_overlay(self,p):
+        vp=self._mesh_target()
+        if vp is None: return
+        p.save(); p.translate(self._offset); p.rotate(self._rot); p.scale(self._scale,self._scale)
+        R=mesh_rect(vp); cols,rows=vp.mesh_cols,vp.mesh_rows
+        P_=[mesh_point_doc(vp,i,R) for i in range(cols*rows)]
+        p.setBrush(Qt.NoBrush); p.setPen(QPen(QColor(C["accent"]),1.2/self._scale,Qt.DashLine))
+        for r in range(rows):
+            for c in range(cols-1): p.drawLine(P_[r*cols+c],P_[r*cols+c+1])
+        for c in range(cols):
+            for r in range(rows-1): p.drawLine(P_[r*cols+c],P_[(r+1)*cols+c])
+        rad=6/self._scale
+        for i,q in enumerate(P_):
+            p.setBrush(QBrush(vp.mesh_colors[i]))
+            p.setPen(QPen(QColor("white" if i!=self._mesh_drag_i else C["node_sel"]),2/self._scale))
+            p.drawEllipse(q,rad,rad)
+        p.restore()
+
     def _trim_press(self,dp):
         """交差点消しゴム: クリックした線のうち、隣り合う交差点までの区間(はみ出し)を削除"""
         hit=self._hit_paths(dp)
@@ -3325,7 +3490,9 @@ class PropsPanel(QWidget):
         self.spin_mesh_r=QSpinBox(); self.spin_mesh_r.setRange(2,6); self.spin_mesh_r.setValue(3); sr.addWidget(self.spin_mesh_r)
         self.spin_mesh_c.valueChanged.connect(self._on_mesh_size); self.spin_mesh_r.valueChanged.connect(self._on_mesh_size)
         self.btn_mesh_edit=QPushButton("メッシュ色を編集…"); self.btn_mesh_edit.clicked.connect(self._edit_mesh)
-        mgl.addWidget(self.chk_mesh); mgl.addLayout(sr); mgl.addWidget(self.btn_mesh_edit)
+        self.btn_mesh_reset=QPushButton("メッシュ点の位置をリセット"); self.btn_mesh_reset.clicked.connect(self._reset_mesh_pts)
+        hint=QLabel("メッシュ編集ツール(M): 点をドラッグで移動 / クリックで色変更"); hint.setWordWrap(True)
+        mgl.addWidget(self.chk_mesh); mgl.addLayout(sr); mgl.addWidget(self.btn_mesh_edit); mgl.addWidget(self.btn_mesh_reset); mgl.addWidget(hint)
         t3l.addWidget(mg); t3l.addStretch()
         tabs.addTab(t3,"グラデ")
         # ── 情報/変形 ──
@@ -3457,6 +3624,12 @@ class PropsPanel(QWidget):
     def _mesh_ensure(self,vp):
         if len(vp.mesh_colors)!=vp.mesh_cols*vp.mesh_rows:
             vp.mesh_colors=default_mesh_colors(vp.mesh_cols,vp.mesh_rows,vp.gradient_start,vp.gradient_end)
+        if len(vp.mesh_pts)!=vp.mesh_cols*vp.mesh_rows:
+            vp.mesh_pts=default_mesh_pts(vp.mesh_cols,vp.mesh_rows)
+
+    def _reset_mesh_pts(self):
+        for vp in self._paths: vp.mesh_pts=default_mesh_pts(vp.mesh_cols,vp.mesh_rows)
+        self.canvas.update(); self.changed.emit()
 
     def _on_mesh_toggle(self,v):
         for vp in self._paths:
@@ -3468,9 +3641,13 @@ class PropsPanel(QWidget):
         c=self.spin_mesh_c.value(); r=self.spin_mesh_r.value()
         for vp in self._paths:
             if len(vp.mesh_colors)==vp.mesh_cols*vp.mesh_rows:
+                if len(vp.mesh_pts)==vp.mesh_cols*vp.mesh_rows:
+                    vp.mesh_pts=mesh_resample_pts(vp.mesh_pts,vp.mesh_cols,vp.mesh_rows,c,r)
+                else: vp.mesh_pts=default_mesh_pts(c,r)
                 vp.mesh_colors=mesh_resample(vp.mesh_colors,vp.mesh_cols,vp.mesh_rows,c,r)
             else:
                 vp.mesh_colors=default_mesh_colors(c,r,vp.gradient_start,vp.gradient_end)
+                vp.mesh_pts=default_mesh_pts(c,r)
             vp.mesh_cols=c; vp.mesh_rows=r
         self.canvas.update(); self.changed.emit()
 
@@ -3694,6 +3871,7 @@ class MainWindow(QMainWindow):
             ("🪣","B",TOOL_BUCKET,"バケツ塗り"),
             ("✂","C",TOOL_SCISSORS,"パス切断"),
             ("✄","T",TOOL_TRIM,"交差点消しゴム"),
+            ("▦","M",TOOL_MESH,"メッシュ編集"),
             ("💬","F2",TOOL_BALLOON,"フキダシ"),
             ("⬜","F3",TOOL_PANEL,"コマ割り"),
             ("⭐","F4",TOOL_FOCUS_LINE,"集中線"),
@@ -3740,7 +3918,7 @@ class MainWindow(QMainWindow):
             TOOL_PEN:"ペン (P)",TOOL_RESHAPE:"Reshape (A)",TOOL_SELECT:"選択 (V)",
             TOOL_HAND:"手のひら (H)",TOOL_ERASER:"消しゴム (E)",
             TOOL_ADD_NODE:"アンカー追加",TOOL_DEL_NODE:"アンカー削除",
-            TOOL_WIDTH:"線幅編集 (W)",TOOL_BUCKET:"バケツ (B)",TOOL_SCISSORS:"パス切断 (C)",TOOL_TRIM:"交差点消しゴム (T)",
+            TOOL_WIDTH:"線幅編集 (W)",TOOL_BUCKET:"バケツ (B)",TOOL_SCISSORS:"パス切断 (C)",TOOL_TRIM:"交差点消しゴム (T)",TOOL_MESH:"メッシュ編集 (M)",
             TOOL_BALLOON:"フキダシ (F2)",TOOL_PANEL:"コマ割り (F3)",
             TOOL_FOCUS_LINE:"集中線 (F4)",TOOL_SPEED_LINE:"効果線 (F5)",
         }
